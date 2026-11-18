@@ -493,6 +493,7 @@ dependencies = [
  "dirs",
  "ratatui",
  "rusqlite",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

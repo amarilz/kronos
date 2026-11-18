@@ -82,8 +82,13 @@ fn write_properties(properties_path: &Path, properties: &BTreeMap<String, String
         writeln!(file, "{key}={}", escape_property_value(value))?;
     }
     file.sync_all()?;
+    drop(file);
+
     replace_file(&temp_path, properties_path)?;
+
+    #[cfg(unix)]
     File::open(parent)?.sync_all()?;
+
     Ok(())
 }
 
@@ -174,10 +179,42 @@ fn unescape_property_value(value: &str) -> Result<String> {
 
 fn replace_file(from: &Path, to: &Path) -> Result<()> {
     #[cfg(windows)]
-    if to.exists() {
-        fs::remove_file(to)?;
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+        let source: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let destination: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+
+        if !to.exists() {
+            return fs::rename(from, to)
+                .with_context(|| format!("Could not create {}", to.display()));
+        }
+
+        let result = unsafe {
+            ReplaceFileW(
+                destination.as_ptr(),
+                source.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+
+        if result == 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("Could not replace {}", to.display()));
+        }
+
+        Ok(())
     }
-    fs::rename(from, to).with_context(|| format!("Could not update {}", to.display()))
+
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
+            .with_context(|| format!("Could not update {}", to.display()))
+    }
 }
 
 #[cfg(test)]
