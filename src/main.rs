@@ -371,7 +371,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         ])
         .split(frame.area());
 
-    let title = Paragraph::new(" KRONOS ")
+    let title = Paragraph::new(concat!(" KRONOS v", env!("CARGO_PKG_VERSION"), " "))
         .style(
             Style::default()
                 .fg(Color::Cyan)

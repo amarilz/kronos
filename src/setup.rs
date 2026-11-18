@@ -150,13 +150,17 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &SetupState, suggested_path: &Pat
         .split(frame.area());
 
     frame.render_widget(
-        Paragraph::new(" Kronos · Database setup ")
-            .style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(concat!(
+            " Kronos v",
+            env!("CARGO_PKG_VERSION"),
+            " · Database setup "
+        ))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(Block::default().borders(Borders::ALL)),
         areas[0],
     );
 
