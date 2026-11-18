@@ -278,11 +278,10 @@ impl App {
     }
 
     fn move_history(&mut self, direction: isize) {
-        if !self.history_weeks.is_empty() {
-            self.history_index = (self.history_index as isize + direction)
-                .rem_euclid(self.history_weeks.len() as isize)
-                as usize;
-        }
+        self.history_index = self
+            .history_index
+            .saturating_add_signed(direction)
+            .min(self.history_weeks.len().saturating_sub(1));
     }
 }
 
@@ -657,6 +656,7 @@ mod tests {
             }
             store.add_study(last_week, topic, previous)?;
         }
+        store.add_study(today - Duration::weeks(2), "algebra", 30)?;
 
         let mut app = App::new(store)?;
         let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
@@ -674,6 +674,15 @@ mod tests {
         press(&mut app, KeyCode::Char('h'))?;
         terminal.draw(|frame| draw(frame, &app))?;
         assert_topic_rows(&terminal, &["design", "algebra", "biology", "chemistry"]);
+
+        press(&mut app, KeyCode::Right)?;
+        assert_eq!(app.history_index, 0);
+        press(&mut app, KeyCode::Left)?;
+        assert_eq!(app.history_index, 1);
+        press(&mut app, KeyCode::Left)?;
+        assert_eq!(app.history_index, 1);
+        press(&mut app, KeyCode::Right)?;
+        assert_eq!(app.history_index, 0);
 
         drop(app);
         std::fs::remove_file(database)?;
