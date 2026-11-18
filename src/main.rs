@@ -23,6 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::{
+    cmp::Reverse,
     io::{self, Stdout},
     path::PathBuf,
     time::Duration as StdDuration,
@@ -62,6 +63,7 @@ struct App {
     study_date: NaiveDate,
     date_input: String,
     topic_input: String,
+    topic_filter: String,
     hours: u32,
     minutes: u32,
     duration_field: usize,
@@ -86,6 +88,7 @@ impl App {
             study_date: today,
             date_input: String::new(),
             topic_input: String::new(),
+            topic_filter: String::new(),
             hours: 0,
             minutes: 0,
             duration_field: 0,
@@ -104,6 +107,10 @@ impl App {
         self.store.rollover_if_needed(today)?;
         self.topics = self.store.topics()?;
         self.current = self.store.load_current()?;
+        let totals = aggregate_current(&self.current);
+        // Stable sorting keeps the store's alphabetical order for equal totals.
+        self.topics
+            .sort_by_key(|topic| Reverse(totals.get(topic).copied().unwrap_or(0)));
         self.history = self.store.load_history()?;
         self.history_weeks = self
             .history
@@ -126,6 +133,8 @@ impl App {
             Screen::Dashboard => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
                 KeyCode::Char('a') => {
+                    self.reload()?;
+                    self.topic_filter.clear();
                     self.selected = 0;
                     self.screen = Screen::TopicSelect;
                 }
@@ -143,11 +152,19 @@ impl App {
             },
             Screen::TopicSelect => match key.code {
                 KeyCode::Esc => self.screen = Screen::Dashboard,
-                KeyCode::Up => self.move_selection(-1, self.topics.len()),
-                KeyCode::Down => self.move_selection(1, self.topics.len()),
-                KeyCode::Enter if !self.topics.is_empty() => {
+                KeyCode::Up => self.move_selection(-1, self.filtered_topics().count()),
+                KeyCode::Down => self.move_selection(1, self.filtered_topics().count()),
+                KeyCode::Enter if self.filtered_topics().next().is_some() => {
                     self.selected_day = 0;
                     self.screen = Screen::DaySelect;
+                }
+                KeyCode::Backspace => {
+                    self.topic_filter.pop();
+                    self.selected = 0;
+                }
+                KeyCode::Char(ch) if !ch.is_control() => {
+                    self.topic_filter.push(ch);
+                    self.selected = 0;
                 }
                 _ => {}
             },
@@ -199,10 +216,10 @@ impl App {
                         bail!("Duration must be greater than zero");
                     }
                     let topic = self
-                        .topics
-                        .get(self.selected)
+                        .filtered_topics()
+                        .nth(self.selected)
                         .context("No topic selected")?
-                        .clone();
+                        .to_owned();
                     self.store.add_study(self.study_date, &topic, total)?;
                     self.reload()?;
                     self.message = format!(
@@ -235,6 +252,14 @@ impl App {
             },
         }
         Ok(())
+    }
+
+    fn filtered_topics(&self) -> impl Iterator<Item = &str> {
+        let query = self.topic_filter.to_lowercase();
+        self.topics
+            .iter()
+            .map(String::as_str)
+            .filter(move |topic| topic.contains(&query))
     }
 
     fn begin_duration(&mut self) {
@@ -272,11 +297,10 @@ impl App {
     }
 
     fn move_history(&mut self, direction: isize) {
-        if !self.history_weeks.is_empty() {
-            self.history_index = (self.history_index as isize + direction)
-                .rem_euclid(self.history_weeks.len() as isize)
-                as usize;
-        }
+        self.history_index = self
+            .history_index
+            .saturating_add_signed(direction)
+            .min(self.history_weeks.len().saturating_sub(1));
     }
 }
 
@@ -371,7 +395,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         ])
         .split(frame.area());
 
-    let title = Paragraph::new(concat!(" KRONOS v", env!("CARGO_PKG_VERSION"), " "))
+    let title = Paragraph::new(concat!(" kronos v", env!("CARGO_PKG_VERSION"), " "))
         .style(
             Style::default()
                 .fg(Color::Cyan)
@@ -382,9 +406,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     match app.screen {
         Screen::Dashboard => draw_dashboard(frame, app, areas[1]),
-        Screen::TopicSelect => {
-            draw_list(frame, "Select a topic", &app.topics, app.selected, areas[1]);
-        }
+        Screen::TopicSelect => draw_topic_select(frame, app, areas[1]),
         Screen::DaySelect => {
             draw_list(
                 frame,
@@ -468,6 +490,34 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layo
             Paragraph::new(app.message.as_str()).style(Style::default().fg(Color::Green)),
             message_area,
         );
+    }
+}
+
+fn draw_topic_select(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
+    let [search, results] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(format!(" Filter: {}_", app.topic_filter)),
+        search,
+    );
+
+    let topics: Vec<_> = app.filtered_topics().collect();
+    if topics.is_empty() {
+        let message = if app.topics.is_empty() {
+            "No topics yet."
+        } else {
+            "No matching topics."
+        };
+        frame.render_widget(
+            Paragraph::new(message).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Select a topic"),
+            ),
+            results,
+        );
+    } else {
+        draw_list(frame, "Select a topic", &topics, app.selected, results);
     }
 }
 
@@ -563,8 +613,10 @@ fn draw_history(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout
         .collect();
     let totals = aggregate_history(&entries);
     let total: u32 = totals.values().sum();
-    let lines = totals
-        .iter()
+    let mut ranked_topics: Vec<_> = totals.into_iter().collect();
+    ranked_topics.sort_by_key(|(_, minutes)| Reverse(*minutes));
+    let lines = ranked_topics
+        .into_iter()
         .map(|(topic, minutes)| {
             Line::from(format!(
                 "  {topic:<20} {:>3}h {:02}m",
@@ -600,9 +652,8 @@ fn help_text(app: &App) -> String {
                 format!(" {} ", app.message)
             }
         }
-        Screen::TopicSelect | Screen::DaySelect => {
-            " ↑↓ Navigate   Enter Confirm   Esc Back ".into()
-        }
+        Screen::TopicSelect => " Type to filter   ↑↓ Navigate   Enter Confirm   Esc Back ".into(),
+        Screen::DaySelect => " ↑↓ Navigate   Enter Confirm   Esc Back ".into(),
         Screen::DateInput | Screen::AddTopic => {
             " Type   Backspace Delete   Enter Confirm   Esc Cancel ".into()
         }
@@ -623,7 +674,102 @@ fn next_step(step: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::next_step;
+    use super::*;
+    use crossterm::event::KeyModifiers;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn study_menu_and_history_rank_topics_by_weekly_duration() -> Result<()> {
+        let database = std::env::temp_dir().join(format!(
+            "kronos-topic-order-{}-{}.sqlite3",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let mut store = Store::create_new(&database)?;
+        let today = Local::now().date_naive();
+        let last_week = today - Duration::weeks(1);
+        for (topic, current, previous) in [
+            ("algebra", 20, 40),
+            ("biology", 20, 40),
+            ("chemistry", 60, 10),
+            ("design", 0, 90),
+        ] {
+            store.add_topic(topic)?;
+            if current > 0 {
+                store.add_study(today, topic, current)?;
+            }
+            store.add_study(last_week, topic, previous)?;
+        }
+        store.add_study(today - Duration::weeks(2), "algebra", 30)?;
+
+        let mut app = App::new(store)?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let press = |app: &mut App, code| app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+
+        press(&mut app, KeyCode::Char('a'))?;
+        terminal.draw(|frame| draw(frame, &app))?;
+        assert_topic_rows(&terminal, &["chemistry", "algebra", "biology", "design"]);
+
+        for key in [KeyCode::Enter, KeyCode::Enter, KeyCode::Up, KeyCode::Enter] {
+            press(&mut app, key)?;
+        }
+        assert_eq!(aggregate_current(&app.current)["chemistry"], 120);
+
+        press(&mut app, KeyCode::Char('a'))?;
+        for key in [KeyCode::Char('I'), KeyCode::Char('x'), KeyCode::Enter] {
+            press(&mut app, key)?;
+        }
+        assert!(matches!(app.screen, Screen::TopicSelect));
+        assert_eq!(app.filtered_topics().count(), 0);
+
+        press(&mut app, KeyCode::Backspace)?;
+        assert_eq!(
+            app.filtered_topics().collect::<Vec<_>>(),
+            ["chemistry", "biology", "design"]
+        );
+        terminal.draw(|frame| draw(frame, &app))?;
+        assert_topic_rows(&terminal, &["chemistry", "biology", "design"]);
+        for key in [
+            KeyCode::Down,
+            KeyCode::Enter,
+            KeyCode::Enter,
+            KeyCode::Up,
+            KeyCode::Enter,
+        ] {
+            press(&mut app, key)?;
+        }
+        assert_eq!(aggregate_current(&app.current)["biology"], 80);
+
+        press(&mut app, KeyCode::Char('h'))?;
+        terminal.draw(|frame| draw(frame, &app))?;
+        assert_topic_rows(&terminal, &["design", "algebra", "biology", "chemistry"]);
+
+        press(&mut app, KeyCode::Right)?;
+        assert_eq!(app.history_index, 0);
+        press(&mut app, KeyCode::Left)?;
+        assert_eq!(app.history_index, 1);
+        press(&mut app, KeyCode::Left)?;
+        assert_eq!(app.history_index, 1);
+        press(&mut app, KeyCode::Right)?;
+        assert_eq!(app.history_index, 0);
+
+        drop(app);
+        std::fs::remove_file(database)?;
+        Ok(())
+    }
+
+    fn assert_topic_rows(terminal: &Terminal<TestBackend>, expected: &[&str]) {
+        let buffer = terminal.backend().buffer();
+        let visible_topics: Vec<_> = buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .filter_map(|row| {
+                let text: String = row.iter().map(|cell| cell.symbol()).collect();
+                expected.iter().copied().find(|topic| text.contains(topic))
+            })
+            .collect();
+        assert_eq!(visible_topics, expected);
+    }
 
     #[test]
     fn duration_step_cycles_through_one_five_and_fifteen_minutes() {
