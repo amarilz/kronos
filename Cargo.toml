@@ -15,3 +15,5 @@ crossterm = "0.28"
 dirs = "6"
 ratatui = "0.29"
 rusqlite = { version = "0.32", features = ["bundled"] }
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
