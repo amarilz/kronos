@@ -23,6 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::{
+    cmp::Reverse,
     io::{self, Stdout},
     path::PathBuf,
     time::Duration as StdDuration,
@@ -104,6 +105,10 @@ impl App {
         self.store.rollover_if_needed(today)?;
         self.topics = self.store.topics()?;
         self.current = self.store.load_current()?;
+        let totals = aggregate_current(&self.current);
+        // Stable sorting keeps the store's alphabetical order for equal totals.
+        self.topics
+            .sort_by_key(|topic| Reverse(totals.get(topic).copied().unwrap_or(0)));
         self.history = self.store.load_history()?;
         self.history_weeks = self
             .history
@@ -126,6 +131,7 @@ impl App {
             Screen::Dashboard => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
                 KeyCode::Char('a') => {
+                    self.reload()?;
                     self.selected = 0;
                     self.screen = Screen::TopicSelect;
                 }
@@ -371,7 +377,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         ])
         .split(frame.area());
 
-    let title = Paragraph::new(concat!(" KRONOS v", env!("CARGO_PKG_VERSION"), " "))
+    let title = Paragraph::new(concat!(" kronos v", env!("CARGO_PKG_VERSION"), " "))
         .style(
             Style::default()
                 .fg(Color::Cyan)
@@ -563,8 +569,10 @@ fn draw_history(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout
         .collect();
     let totals = aggregate_history(&entries);
     let total: u32 = totals.values().sum();
-    let lines = totals
-        .iter()
+    let mut ranked_topics: Vec<_> = totals.into_iter().collect();
+    ranked_topics.sort_by_key(|(_, minutes)| Reverse(*minutes));
+    let lines = ranked_topics
+        .into_iter()
         .map(|(topic, minutes)| {
             Line::from(format!(
                 "  {topic:<20} {:>3}h {:02}m",
@@ -623,7 +631,67 @@ fn next_step(step: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::next_step;
+    use super::*;
+    use crossterm::event::KeyModifiers;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn study_menu_and_history_rank_topics_by_weekly_duration() -> Result<()> {
+        let database = std::env::temp_dir().join(format!(
+            "kronos-topic-order-{}-{}.sqlite3",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let mut store = Store::create_new(&database)?;
+        let today = Local::now().date_naive();
+        let last_week = today - Duration::weeks(1);
+        for (topic, current, previous) in [
+            ("algebra", 20, 40),
+            ("biology", 20, 40),
+            ("chemistry", 60, 10),
+            ("design", 0, 90),
+        ] {
+            store.add_topic(topic)?;
+            if current > 0 {
+                store.add_study(today, topic, current)?;
+            }
+            store.add_study(last_week, topic, previous)?;
+        }
+
+        let mut app = App::new(store)?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let press = |app: &mut App, code| app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+
+        press(&mut app, KeyCode::Char('a'))?;
+        terminal.draw(|frame| draw(frame, &app))?;
+        assert_topic_rows(&terminal, &["chemistry", "algebra", "biology", "design"]);
+
+        for key in [KeyCode::Enter, KeyCode::Enter, KeyCode::Up, KeyCode::Enter] {
+            press(&mut app, key)?;
+        }
+        assert_eq!(aggregate_current(&app.current)["chemistry"], 120);
+
+        press(&mut app, KeyCode::Char('h'))?;
+        terminal.draw(|frame| draw(frame, &app))?;
+        assert_topic_rows(&terminal, &["design", "algebra", "biology", "chemistry"]);
+
+        drop(app);
+        std::fs::remove_file(database)?;
+        Ok(())
+    }
+
+    fn assert_topic_rows(terminal: &Terminal<TestBackend>, expected: &[&str]) {
+        let buffer = terminal.backend().buffer();
+        let visible_topics: Vec<_> = buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .filter_map(|row| {
+                let text: String = row.iter().map(|cell| cell.symbol()).collect();
+                expected.iter().copied().find(|topic| text.contains(topic))
+            })
+            .collect();
+        assert_eq!(visible_topics, expected);
+    }
 
     #[test]
     fn duration_step_cycles_through_one_five_and_fifteen_minutes() {
