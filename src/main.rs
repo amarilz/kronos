@@ -43,6 +43,7 @@ enum Screen {
 struct App {
     store: Store,
     topics: Vec<String>,
+    studied_topic_count: usize,
     current: Vec<CurrentEntry>,
     history: Vec<HistoryEntry>,
     screen: Screen,
@@ -67,6 +68,7 @@ impl App {
         let mut app = Self {
             store,
             topics: Vec::new(),
+            studied_topic_count: 0,
             current: Vec::new(),
             history: Vec::new(),
             screen: Screen::Dashboard,
@@ -94,6 +96,7 @@ impl App {
         self.topics = self.store.topics()?;
         self.current = self.store.load_current()?;
         let totals = aggregate_current(&self.current);
+        self.studied_topic_count = totals.values().filter(|&&minutes| minutes > 0).count();
         // Stable sorting keeps the store's alphabetical order for equal totals.
         self.topics
             .sort_by_key(|topic| Reverse(totals.get(topic).copied().unwrap_or(0)));
@@ -106,7 +109,9 @@ impl App {
             .into_iter()
             .rev()
             .collect();
-        self.selected = self.selected.min(self.topics.len().saturating_sub(1));
+        self.selected = self
+            .selected
+            .min(self.studied_topic_count.saturating_sub(1));
         self.history_index = self
             .history_index
             .min(self.history_weeks.len().saturating_sub(1));
@@ -132,8 +137,8 @@ impl App {
                     self.history_index = 0;
                     self.screen = Screen::History;
                 }
-                KeyCode::Down => self.move_selection(1, self.topics.len()),
-                KeyCode::Up => self.move_selection(-1, self.topics.len()),
+                KeyCode::Down => self.move_selection(1, self.studied_topic_count),
+                KeyCode::Up => self.move_selection(-1, self.studied_topic_count),
                 _ => {}
             },
             Screen::TopicSelect => match key.code {
@@ -411,8 +416,9 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layo
     let rows = app
         .topics
         .iter()
+        .take(app.studied_topic_count)
         .map(|topic| {
-            let minutes = totals.get(topic).copied().unwrap_or_default();
+            let minutes = totals[topic];
             ListItem::new(format!(
                 "  {topic:<20} {:>3}h {:02}m",
                 minutes / 60,
@@ -421,7 +427,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layo
         })
         .collect::<Vec<_>>();
     let rows = if rows.is_empty() {
-        vec![ListItem::new("  No topics yet: press `t` to add one.")]
+        vec![ListItem::new("  No study time recorded this week.")]
     } else {
         rows
     };
@@ -438,8 +444,8 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layo
         )
         .highlight_symbol("> ");
     let mut state = ListState::default();
-    if !app.topics.is_empty() {
-        state.select(Some(app.selected.min(app.topics.len() - 1)));
+    if app.studied_topic_count > 0 {
+        state.select(Some(app.selected.min(app.studied_topic_count - 1)));
     }
     frame.render_stateful_widget(list, area, &mut state);
     if !app.message.is_empty() {
@@ -666,6 +672,7 @@ fn next_step(step: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
 
@@ -696,6 +703,17 @@ mod tests {
         let mut app = App::new(store)?;
         let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
         let press = |app: &mut App, code| app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+
+        terminal.draw(|frame| draw(frame, &app))?;
+        assert_topic_rows(&terminal, &["chemistry", "algebra", "biology"]);
+        let dashboard: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!dashboard.contains("design"));
 
         press(&mut app, KeyCode::Char('a'))?;
         terminal.draw(|frame| draw(frame, &app))?;
