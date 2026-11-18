@@ -63,6 +63,7 @@ struct App {
     study_date: NaiveDate,
     date_input: String,
     topic_input: String,
+    topic_filter: String,
     hours: u32,
     minutes: u32,
     duration_field: usize,
@@ -87,6 +88,7 @@ impl App {
             study_date: today,
             date_input: String::new(),
             topic_input: String::new(),
+            topic_filter: String::new(),
             hours: 0,
             minutes: 0,
             duration_field: 0,
@@ -132,6 +134,7 @@ impl App {
                 KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
                 KeyCode::Char('a') => {
                     self.reload()?;
+                    self.topic_filter.clear();
                     self.selected = 0;
                     self.screen = Screen::TopicSelect;
                 }
@@ -149,11 +152,19 @@ impl App {
             },
             Screen::TopicSelect => match key.code {
                 KeyCode::Esc => self.screen = Screen::Dashboard,
-                KeyCode::Up => self.move_selection(-1, self.topics.len()),
-                KeyCode::Down => self.move_selection(1, self.topics.len()),
-                KeyCode::Enter if !self.topics.is_empty() => {
+                KeyCode::Up => self.move_selection(-1, self.filtered_topics().count()),
+                KeyCode::Down => self.move_selection(1, self.filtered_topics().count()),
+                KeyCode::Enter if self.filtered_topics().next().is_some() => {
                     self.selected_day = 0;
                     self.screen = Screen::DaySelect;
+                }
+                KeyCode::Backspace => {
+                    self.topic_filter.pop();
+                    self.selected = 0;
+                }
+                KeyCode::Char(ch) if !ch.is_control() => {
+                    self.topic_filter.push(ch);
+                    self.selected = 0;
                 }
                 _ => {}
             },
@@ -205,10 +216,10 @@ impl App {
                         bail!("Duration must be greater than zero");
                     }
                     let topic = self
-                        .topics
-                        .get(self.selected)
+                        .filtered_topics()
+                        .nth(self.selected)
                         .context("No topic selected")?
-                        .clone();
+                        .to_owned();
                     self.store.add_study(self.study_date, &topic, total)?;
                     self.reload()?;
                     self.message = format!(
@@ -241,6 +252,14 @@ impl App {
             },
         }
         Ok(())
+    }
+
+    fn filtered_topics(&self) -> impl Iterator<Item = &str> {
+        let query = self.topic_filter.to_lowercase();
+        self.topics
+            .iter()
+            .map(String::as_str)
+            .filter(move |topic| topic.contains(&query))
     }
 
     fn begin_duration(&mut self) {
@@ -387,9 +406,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     match app.screen {
         Screen::Dashboard => draw_dashboard(frame, app, areas[1]),
-        Screen::TopicSelect => {
-            draw_list(frame, "Select a topic", &app.topics, app.selected, areas[1]);
-        }
+        Screen::TopicSelect => draw_topic_select(frame, app, areas[1]),
         Screen::DaySelect => {
             draw_list(
                 frame,
@@ -473,6 +490,34 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layo
             Paragraph::new(app.message.as_str()).style(Style::default().fg(Color::Green)),
             message_area,
         );
+    }
+}
+
+fn draw_topic_select(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
+    let [search, results] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(format!(" Filter: {}_", app.topic_filter)),
+        search,
+    );
+
+    let topics: Vec<_> = app.filtered_topics().collect();
+    if topics.is_empty() {
+        let message = if app.topics.is_empty() {
+            "No topics yet."
+        } else {
+            "No matching topics."
+        };
+        frame.render_widget(
+            Paragraph::new(message).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Select a topic"),
+            ),
+            results,
+        );
+    } else {
+        draw_list(frame, "Select a topic", &topics, app.selected, results);
     }
 }
 
@@ -607,9 +652,8 @@ fn help_text(app: &App) -> String {
                 format!(" {} ", app.message)
             }
         }
-        Screen::TopicSelect | Screen::DaySelect => {
-            " ↑↓ Navigate   Enter Confirm   Esc Back ".into()
-        }
+        Screen::TopicSelect => " Type to filter   ↑↓ Navigate   Enter Confirm   Esc Back ".into(),
+        Screen::DaySelect => " ↑↓ Navigate   Enter Confirm   Esc Back ".into(),
         Screen::DateInput | Screen::AddTopic => {
             " Type   Backspace Delete   Enter Confirm   Esc Cancel ".into()
         }
@@ -670,6 +714,31 @@ mod tests {
             press(&mut app, key)?;
         }
         assert_eq!(aggregate_current(&app.current)["chemistry"], 120);
+
+        press(&mut app, KeyCode::Char('a'))?;
+        for key in [KeyCode::Char('I'), KeyCode::Char('x'), KeyCode::Enter] {
+            press(&mut app, key)?;
+        }
+        assert!(matches!(app.screen, Screen::TopicSelect));
+        assert_eq!(app.filtered_topics().count(), 0);
+
+        press(&mut app, KeyCode::Backspace)?;
+        assert_eq!(
+            app.filtered_topics().collect::<Vec<_>>(),
+            ["chemistry", "biology", "design"]
+        );
+        terminal.draw(|frame| draw(frame, &app))?;
+        assert_topic_rows(&terminal, &["chemistry", "biology", "design"]);
+        for key in [
+            KeyCode::Down,
+            KeyCode::Enter,
+            KeyCode::Enter,
+            KeyCode::Up,
+            KeyCode::Enter,
+        ] {
+            press(&mut app, key)?;
+        }
+        assert_eq!(aggregate_current(&app.current)["biology"], 80);
 
         press(&mut app, KeyCode::Char('h'))?;
         terminal.draw(|frame| draw(frame, &app))?;
