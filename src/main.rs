@@ -4,7 +4,7 @@ mod setup;
 mod storage;
 
 use anyhow::{Context, Result, bail};
-use chrono::{Duration, Local, NaiveDate};
+use chrono::{Local, Months, NaiveDate};
 use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
@@ -30,23 +30,11 @@ use std::{
 };
 use storage::Store;
 
-const DAYS: [&str; 8] = [
-    "Today",
-    "Yesterday",
-    "2 days ago",
-    "3 days ago",
-    "4 days ago",
-    "5 days ago",
-    "6 days ago",
-    "Choose another date",
-];
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Screen {
     Dashboard,
     TopicSelect,
-    DaySelect,
-    DateInput,
+    DateSelect,
     Duration,
     AddTopic,
     History,
@@ -59,9 +47,8 @@ struct App {
     history: Vec<HistoryEntry>,
     screen: Screen,
     selected: usize,
-    selected_day: usize,
+    date_field: usize,
     study_date: NaiveDate,
-    date_input: String,
     topic_input: String,
     topic_filter: String,
     hours: u32,
@@ -84,9 +71,8 @@ impl App {
             history: Vec::new(),
             screen: Screen::Dashboard,
             selected: 0,
-            selected_day: 0,
+            date_field: 0,
             study_date: today,
-            date_input: String::new(),
             topic_input: String::new(),
             topic_filter: String::new(),
             hours: 0,
@@ -155,8 +141,9 @@ impl App {
                 KeyCode::Up => self.move_selection(-1, self.filtered_topics().count()),
                 KeyCode::Down => self.move_selection(1, self.filtered_topics().count()),
                 KeyCode::Enter if self.filtered_topics().next().is_some() => {
-                    self.selected_day = 0;
-                    self.screen = Screen::DaySelect;
+                    self.study_date = Local::now().date_naive();
+                    self.date_field = 0;
+                    self.screen = Screen::DateSelect;
                 }
                 KeyCode::Backspace => {
                     self.topic_filter.pop();
@@ -168,43 +155,17 @@ impl App {
                 }
                 _ => {}
             },
-            Screen::DaySelect => match key.code {
+            Screen::DateSelect => match key.code {
                 KeyCode::Esc => self.screen = Screen::TopicSelect,
-                KeyCode::Up => self.move_day(-1),
-                KeyCode::Down => self.move_day(1),
-                KeyCode::Enter => {
-                    if self.selected_day == DAYS.len() - 1 {
-                        self.date_input.clear();
-                        self.screen = Screen::DateInput;
-                    } else {
-                        self.study_date =
-                            Local::now().date_naive() - Duration::days(self.selected_day as i64);
-                        self.begin_duration();
-                    }
-                }
-                _ => {}
-            },
-            Screen::DateInput => match key.code {
-                KeyCode::Esc => self.screen = Screen::DaySelect,
-                KeyCode::Backspace => {
-                    self.date_input.pop();
-                }
-                KeyCode::Enter => {
-                    let date = NaiveDate::parse_from_str(&self.date_input, "%Y-%m-%d")
-                        .context("Invalid date: use the YYYY-MM-DD format")?;
-                    if date > Local::now().date_naive() {
-                        bail!("The date cannot be in the future");
-                    }
-                    self.study_date = date;
-                    self.begin_duration();
-                }
-                KeyCode::Char(ch) if ch.is_ascii_digit() || ch == '-' => {
-                    self.date_input.push(ch);
-                }
+                KeyCode::Left => self.date_field = self.date_field.saturating_sub(1),
+                KeyCode::Right => self.date_field = (self.date_field + 1).min(2),
+                KeyCode::Up => self.adjust_study_date(true),
+                KeyCode::Down => self.adjust_study_date(false),
+                KeyCode::Enter => self.begin_duration(),
                 _ => {}
             },
             Screen::Duration => match key.code {
-                KeyCode::Esc => self.screen = Screen::DaySelect,
+                KeyCode::Esc => self.screen = Screen::DateSelect,
                 KeyCode::Left => self.duration_field = 0,
                 KeyCode::Right => self.duration_field = 1,
                 KeyCode::Up => self.adjust_duration(1),
@@ -291,9 +252,25 @@ impl App {
         self.selected = (self.selected as isize + direction).rem_euclid(length as isize) as usize;
     }
 
-    fn move_day(&mut self, direction: isize) {
-        self.selected_day =
-            (self.selected_day as isize + direction).rem_euclid(DAYS.len() as isize) as usize;
+    fn adjust_study_date(&mut self, forward: bool) {
+        let date = self.study_date;
+        let adjusted = if self.date_field == 0 {
+            if forward {
+                date.succ_opt()
+            } else {
+                date.pred_opt()
+            }
+        } else {
+            let months = Months::new(if self.date_field == 1 { 1 } else { 12 });
+            if forward {
+                date.checked_add_months(months)
+            } else {
+                date.checked_sub_months(months)
+            }
+        };
+        if let Some(adjusted) = adjusted.filter(|date| *date <= Local::now().date_naive()) {
+            self.study_date = adjusted;
+        }
     }
 
     fn move_history(&mut self, direction: isize) {
@@ -407,21 +384,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     match app.screen {
         Screen::Dashboard => draw_dashboard(frame, app, areas[1]),
         Screen::TopicSelect => draw_topic_select(frame, app, areas[1]),
-        Screen::DaySelect => {
-            draw_list(
-                frame,
-                "When did you study?",
-                &DAYS,
-                app.selected_day,
-                areas[1],
-            );
-        }
-        Screen::DateInput => draw_input(
-            frame,
-            "Enter a date (YYYY-MM-DD)",
-            &app.date_input,
-            areas[1],
-        ),
+        Screen::DateSelect => draw_date_select(frame, app, areas[1]),
         Screen::Duration => draw_duration(frame, app, areas[1]),
         Screen::AddTopic => draw_input(
             frame,
@@ -562,6 +525,36 @@ fn draw_input(
     frame.render_widget(input, area);
 }
 
+fn draw_date_select(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
+    let selected_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let date = app.study_date;
+    let fields = ["%d", "%m", "%Y"];
+    let mut values = Line::default();
+    for (index, format) in fields.into_iter().enumerate() {
+        if index > 0 {
+            values.push_span(" / ");
+        }
+        let style = if app.date_field == index {
+            selected_style
+        } else {
+            Style::default()
+        };
+        values.push_span(Span::styled(date.format(format).to_string(), style));
+    }
+    frame.render_widget(
+        Paragraph::new(vec![values, Line::from(date.format("%A").to_string())])
+            .centered()
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("When did you study?"),
+            ),
+        area,
+    );
+}
+
 fn draw_duration(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
     let selected_style = Style::default()
         .fg(Color::Yellow)
@@ -653,10 +646,8 @@ fn help_text(app: &App) -> String {
             }
         }
         Screen::TopicSelect => " Type to filter   ↑↓ Navigate   Enter Confirm   Esc Back ".into(),
-        Screen::DaySelect => " ↑↓ Navigate   Enter Confirm   Esc Back ".into(),
-        Screen::DateInput | Screen::AddTopic => {
-            " Type   Backspace Delete   Enter Confirm   Esc Cancel ".into()
-        }
+        Screen::DateSelect => " ←→ Day/Month/Year   ↑↓ Adjust   Enter Confirm   Esc Back ".into(),
+        Screen::AddTopic => " Type   Backspace Delete   Enter Confirm   Esc Cancel ".into(),
         Screen::Duration => {
             " ←→ Field   ↑↓ Adjust   s Step 1/5/15m   Enter Save   Esc Back ".into()
         }
@@ -710,7 +701,44 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app))?;
         assert_topic_rows(&terminal, &["chemistry", "algebra", "biology", "design"]);
 
-        for key in [KeyCode::Enter, KeyCode::Enter, KeyCode::Up, KeyCode::Enter] {
+        press(&mut app, KeyCode::Enter)?;
+        assert_eq!(app.study_date, today);
+        press(&mut app, KeyCode::Up)?;
+        assert_eq!(app.study_date, today);
+
+        app.study_date = NaiveDate::from_ymd_opt(2023, 12, 31).unwrap();
+        press(&mut app, KeyCode::Up)?;
+        assert_eq!(app.study_date, NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
+        press(&mut app, KeyCode::Down)?;
+        assert_eq!(
+            app.study_date,
+            NaiveDate::from_ymd_opt(2023, 12, 31).unwrap()
+        );
+        press(&mut app, KeyCode::Right)?;
+        press(&mut app, KeyCode::Up)?;
+        assert_eq!(
+            app.study_date,
+            NaiveDate::from_ymd_opt(2024, 1, 31).unwrap()
+        );
+        press(&mut app, KeyCode::Up)?;
+        assert_eq!(
+            app.study_date,
+            NaiveDate::from_ymd_opt(2024, 2, 29).unwrap()
+        );
+        press(&mut app, KeyCode::Right)?;
+        press(&mut app, KeyCode::Down)?;
+        assert_eq!(
+            app.study_date,
+            NaiveDate::from_ymd_opt(2023, 2, 28).unwrap()
+        );
+
+        for key in [
+            KeyCode::Esc,
+            KeyCode::Enter,
+            KeyCode::Enter,
+            KeyCode::Up,
+            KeyCode::Enter,
+        ] {
             press(&mut app, key)?;
         }
         assert_eq!(aggregate_current(&app.current)["chemistry"], 120);
