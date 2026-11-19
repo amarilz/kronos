@@ -38,6 +38,14 @@ enum Screen {
     EditGoal,
 }
 
+const HOME_ACTIONS: [(&str, char); 5] = [
+    ("Start timer", 'm'),
+    ("Log time", 'a'),
+    ("History", 'h'),
+    ("Goals", 'g'),
+    ("Quit", 'q'),
+];
+
 struct App {
     store: Store,
     active_timer: Option<ActiveTimer>,
@@ -49,14 +57,19 @@ struct App {
     weekly_goals: Vec<WeeklyGoal>,
     screen: Screen,
     selected: usize,
+    home_selection: usize,
+    dashboard_scroll: usize,
+    resume_discard: bool,
+    timer_quit: bool,
+    topic_creation_origin: Screen,
+    study_topic: String,
+    date_draft: NaiveDate,
+    date_focused: bool,
+    duration_input: String,
     date_field: usize,
     study_date: NaiveDate,
     topic_input: String,
     topic_filter: String,
-    hours: u32,
-    minutes: u32,
-    duration_field: usize,
-    step: u32,
     history_weeks: Vec<(i32, u32)>,
     history_index: usize,
     goal_progress: GoalProgress,
@@ -80,14 +93,19 @@ impl App {
             weekly_goals: Vec::new(),
             screen: Screen::Dashboard,
             selected: 0,
+            home_selection: 0,
+            dashboard_scroll: 0,
+            resume_discard: false,
+            timer_quit: false,
+            topic_creation_origin: Screen::Dashboard,
+            study_topic: String::new(),
+            date_draft: today,
+            date_focused: false,
+            duration_input: String::new(),
             date_field: 0,
             study_date: today,
             topic_input: String::new(),
             topic_filter: String::new(),
-            hours: 0,
-            minutes: 0,
-            duration_field: 0,
-            step: 1,
             history_weeks: Vec::new(),
             history_index: 0,
             goal_progress: GoalProgress::NoGoal,
@@ -126,9 +144,6 @@ impl App {
             .sort_by_key(|topic| Reverse(totals.get(topic).copied().unwrap_or(0)));
         self.snapshot_date = today;
         self.history_weeks = history_weeks(today, &self.history, &self.pending_history);
-        self.selected = self
-            .selected
-            .min(self.studied_topic_count.saturating_sub(1));
         self.history_index = self
             .history_index
             .min(self.history_weeks.len().saturating_sub(1));
@@ -136,12 +151,28 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        if key.kind == KeyEventKind::Release
+            || (key.code == KeyCode::Enter && key.kind != KeyEventKind::Press)
+        {
+            return Ok(());
+        }
         self.message.clear();
+        let mut key = key;
+        if self.screen == Screen::Dashboard
+            && self.active_timer.is_none()
+            && key.code == KeyCode::Enter
+        {
+            key.code = KeyCode::Char(HOME_ACTIONS[self.home_selection].1);
+        }
         if self.screen != Screen::ResumeTimer
             && let Some(timer) = &self.active_timer
         {
             match key.code {
-                KeyCode::Char('m') if key.kind == KeyEventKind::Press => {
+                KeyCode::Left | KeyCode::Up => self.timer_quit = false,
+                KeyCode::Right | KeyCode::Down => self.timer_quit = true,
+                KeyCode::Tab | KeyCode::BackTab => self.timer_quit = !self.timer_quit,
+                KeyCode::Enter if self.timer_quit => self.quit = true,
+                KeyCode::Enter | KeyCode::Char('m') if key.kind == KeyEventKind::Press => {
                     let result = self.store.stop_timer(timer.id, Utc::now())?;
                     self.screen = Screen::Dashboard;
                     self.reload()?;
@@ -160,9 +191,17 @@ impl App {
 
         match self.screen {
             Screen::ResumeTimer => match key.code {
-                KeyCode::Char('y' | 'Y' | 'n' | 'N') if key.kind == KeyEventKind::Press => {
+                KeyCode::Left | KeyCode::Up => self.resume_discard = false,
+                KeyCode::Right | KeyCode::Down => self.resume_discard = true,
+                KeyCode::Tab | KeyCode::BackTab => self.resume_discard = !self.resume_discard,
+                KeyCode::Enter | KeyCode::Char('y' | 'Y' | 'n' | 'N')
+                    if key.kind == KeyEventKind::Press =>
+                {
                     let pending_id = self.active_timer.as_ref().map(|timer| timer.id);
-                    let discard = matches!(key.code, KeyCode::Char('n' | 'N'));
+                    let discard = match key.code {
+                        KeyCode::Enter => self.resume_discard,
+                        _ => matches!(key.code, KeyCode::Char('n' | 'N')),
+                    };
                     if discard && let Some(id) = pending_id {
                         self.store.discard_timer(id)?;
                     }
@@ -194,8 +233,7 @@ impl App {
                     self.screen = Screen::TopicSelect;
                 }
                 KeyCode::Char('t') => {
-                    self.topic_input.clear();
-                    self.screen = Screen::AddTopic;
+                    self.open_topic_creation(Screen::Dashboard);
                 }
                 KeyCode::Char('g') => self.open_goal_progress()?,
                 KeyCode::Char('h') => {
@@ -203,32 +241,31 @@ impl App {
                     self.history_index = 0;
                     self.screen = Screen::History;
                 }
-                KeyCode::Down => self.move_selection(1, self.studied_topic_count),
-                KeyCode::Up => self.move_selection(-1, self.studied_topic_count),
+                KeyCode::PageUp => self.dashboard_scroll = self.dashboard_scroll.saturating_sub(1),
+                KeyCode::PageDown => {
+                    self.dashboard_scroll =
+                        (self.dashboard_scroll + 1).min(self.studied_topic_count.saturating_sub(1));
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    self.home_selection = (self.home_selection + 1) % HOME_ACTIONS.len();
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.home_selection =
+                        (self.home_selection + HOME_ACTIONS.len() - 1) % HOME_ACTIONS.len();
+                }
                 _ => {}
             },
             Screen::TopicSelect | Screen::TimerTopicSelect => match key.code {
                 KeyCode::Esc => self.screen = Screen::Dashboard,
-                KeyCode::Up => self.move_selection(-1, self.filtered_topics().count()),
-                KeyCode::Down => self.move_selection(1, self.filtered_topics().count()),
-                KeyCode::Enter
-                    if self.screen == Screen::TimerTopicSelect
-                        && self.filtered_topics().next().is_some() =>
-                {
-                    let topic = self
-                        .filtered_topics()
-                        .nth(self.selected)
-                        .context("No topic selected")?
-                        .to_owned();
-                    let result = self.store.start_timer(&topic, Utc::now());
-                    self.screen = Screen::Dashboard;
-                    self.reload()?;
-                    result?;
-                }
-                KeyCode::Enter if self.filtered_topics().next().is_some() => {
-                    self.study_date = Local::now().date_naive();
-                    self.date_field = 0;
-                    self.screen = Screen::DateSelect;
+                KeyCode::Up => self.move_selection(-1, self.filtered_topics().count() + 1),
+                KeyCode::Down => self.move_selection(1, self.filtered_topics().count() + 1),
+                KeyCode::Enter => {
+                    let topic = self.filtered_topics().nth(self.selected).map(str::to_owned);
+                    if let Some(topic) = topic {
+                        self.continue_with_topic(self.screen, topic)?;
+                    } else {
+                        self.open_topic_creation(self.screen);
+                    }
                 }
                 KeyCode::Backspace => {
                     self.topic_filter.pop();
@@ -241,58 +278,74 @@ impl App {
                 _ => {}
             },
             Screen::DateSelect => match key.code {
-                KeyCode::Esc => self.screen = Screen::TopicSelect,
+                KeyCode::Esc => self.screen = Screen::Duration,
                 KeyCode::Left => self.date_field = self.date_field.saturating_sub(1),
                 KeyCode::Right => self.date_field = (self.date_field + 1).min(2),
                 KeyCode::Up => self.adjust_study_date(true),
                 KeyCode::Down => self.adjust_study_date(false),
-                KeyCode::Enter => self.begin_duration(),
+                KeyCode::Enter => {
+                    self.study_date = self.date_draft;
+                    self.screen = Screen::Duration;
+                }
                 _ => {}
             },
             Screen::Duration => match key.code {
-                KeyCode::Esc => self.screen = Screen::DateSelect,
-                KeyCode::Left => self.duration_field = 0,
-                KeyCode::Right => self.duration_field = 1,
-                KeyCode::Up => self.adjust_duration(1),
-                KeyCode::Down => self.adjust_duration(-1),
-                KeyCode::Char('s') => self.step = next_step(self.step),
+                KeyCode::Esc => self.screen = Screen::TopicSelect,
+                KeyCode::Tab | KeyCode::BackTab => self.date_focused = !self.date_focused,
+                KeyCode::Up => self.date_focused = false,
+                KeyCode::Down => self.date_focused = true,
+                KeyCode::Enter if self.date_focused => {
+                    self.date_draft = self.study_date;
+                    self.date_field = 0;
+                    self.screen = Screen::DateSelect;
+                }
                 KeyCode::Enter => {
-                    let total = self.hours * 60 + self.minutes;
-                    if total == 0 {
-                        bail!("Duration must be greater than zero");
-                    }
-                    let topic = self
-                        .filtered_topics()
-                        .nth(self.selected)
-                        .context("No topic selected")?
-                        .to_owned();
-                    self.store.add_study(self.study_date, &topic, total)?;
+                    let total = ui::study_entry::parse_duration(&self.duration_input)?;
+                    self.store
+                        .add_study(self.study_date, &self.study_topic, total)?;
                     self.reload()?;
                     self.message = format!(
-                        "Added {}h {}m to {} on {}",
-                        self.hours, self.minutes, topic, self.study_date
+                        "Logged {} for {} on {}",
+                        ui::format_duration(u64::from(total) * 60_000),
+                        self.study_topic,
+                        self.study_date,
                     );
                     self.screen = Screen::Dashboard;
+                }
+                KeyCode::Backspace if !self.date_focused => {
+                    self.duration_input.pop();
+                }
+                KeyCode::Char(ch) if !self.date_focused && !ch.is_control() => {
+                    self.duration_input.push(ch);
                 }
                 _ => {}
             },
             Screen::AddTopic => match key.code {
-                KeyCode::Esc => self.screen = Screen::Dashboard,
+                KeyCode::Esc => self.screen = self.topic_creation_origin,
                 KeyCode::Backspace => {
                     self.topic_input.pop();
                 }
                 KeyCode::Enter => {
-                    self.store.add_topic(&self.topic_input)?;
+                    let topic = self.topic_input.trim().to_lowercase();
+                    self.store.add_topic(&topic)?;
+                    let origin = self.topic_creation_origin;
+                    self.screen = origin;
                     self.reload()?;
-                    self.message = format!("Topic \"{}\" added", self.topic_input.trim());
-                    self.screen = Screen::Dashboard;
+                    if origin == Screen::Dashboard {
+                        self.message = format!("Topic \"{topic}\" added");
+                    } else {
+                        self.topic_filter = topic.clone();
+                        let selected = self.filtered_topics().position(|item| item == topic);
+                        self.selected = selected.unwrap_or(0);
+                        self.continue_with_topic(origin, topic)?;
+                    }
                 }
                 KeyCode::Char(ch) if !ch.is_control() => self.topic_input.push(ch),
                 _ => {}
             },
             Screen::GoalProgress => match key.code {
                 KeyCode::Esc | KeyCode::Char('g') => self.screen = Screen::Dashboard,
-                KeyCode::Char('e') => {
+                KeyCode::Enter | KeyCode::Char('e') => {
                     self.goal_input.clear();
                     self.screen = Screen::EditGoal;
                 }
@@ -335,25 +388,37 @@ impl App {
             .filter(move |topic| topic.contains(&query))
     }
 
-    fn begin_duration(&mut self) {
-        self.hours = 0;
-        self.minutes = 0;
-        self.duration_field = 0;
-        self.step = 1;
-        self.screen = Screen::Duration;
+    fn open_topic_creation(&mut self, origin: Screen) {
+        self.topic_creation_origin = origin;
+        self.topic_input = if origin == Screen::Dashboard {
+            String::new()
+        } else {
+            self.topic_filter.clone()
+        };
+        self.screen = Screen::AddTopic;
     }
 
-    fn adjust_duration(&mut self, direction: i64) {
-        let total = self.hours.saturating_mul(60).saturating_add(self.minutes);
-        let delta = if self.duration_field == 0 {
-            60
-        } else {
-            self.step
-        } as i64
-            * direction;
-        let updated = (total as i64 + delta).clamp(0, 99 * 60 + 59) as u32;
-        self.hours = updated / 60;
-        self.minutes = updated % 60;
+    fn continue_with_topic(&mut self, origin: Screen, topic: String) -> Result<()> {
+        match origin {
+            Screen::TimerTopicSelect => {
+                let result = self.store.start_timer(&topic, Utc::now());
+                self.reload()?;
+                if self.active_timer.is_some() {
+                    self.timer_quit = false;
+                    self.screen = Screen::Dashboard;
+                }
+                result?;
+            }
+            Screen::TopicSelect => {
+                self.study_topic = topic;
+                self.study_date = Local::now().date_naive();
+                self.date_focused = false;
+                self.duration_input.clear();
+                self.screen = Screen::Duration;
+            }
+            _ => unreachable!("Only study workflows select topics"),
+        }
+        Ok(())
     }
 
     fn move_selection(&mut self, direction: isize, length: usize) {
@@ -365,7 +430,7 @@ impl App {
     }
 
     fn adjust_study_date(&mut self, forward: bool) {
-        let date = self.study_date;
+        let date = self.date_draft;
         let adjusted = if self.date_field == 0 {
             if forward {
                 date.succ_opt()
@@ -381,7 +446,7 @@ impl App {
             }
         };
         if let Some(adjusted) = adjusted.filter(|date| *date <= Local::now().date_naive()) {
-            self.study_date = adjusted;
+            self.date_draft = adjusted;
         }
     }
 
@@ -479,14 +544,6 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
     Ok(())
 }
 
-fn next_step(step: u32) -> u32 {
-    match step {
-        1 => 5,
-        5 => 15,
-        _ => 1,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,11 +587,11 @@ mod tests {
         ] {
             terminal.draw(|frame| ui::draw(frame, &app))?;
             let buffer = terminal.backend().buffer().content();
-            let goal_row: String = buffer[400..480].iter().map(|cell| cell.symbol()).collect();
-            let balance_row: String = buffer[480..560].iter().map(|cell| cell.symbol()).collect();
+            let goal_row: String = buffer[240..320].iter().map(|cell| cell.symbol()).collect();
+            let balance_row: String = buffer[320..400].iter().map(|cell| cell.symbol()).collect();
             assert!(goal_row.contains(&format!("Weekly goal  {goal}")));
             assert!(balance_row.contains(balance));
-            assert_eq!(buffer[481].fg, color);
+            assert_eq!(buffer[321].fg, color);
             app.handle_key(key(KeyCode::Left))?;
         }
 
@@ -563,7 +620,8 @@ mod tests {
             if studied_ms > expected_ms)
         );
         terminal.draw(|frame| ui::draw(frame, &app))?;
-        let status = &terminal.backend().buffer().content()[240..320];
+        let row_start = (HOME_ACTIONS.len() + 1) * 80;
+        let status = &terminal.backend().buffer().content()[row_start..row_start + 80];
         let text: String = status.iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains("This week · Behind by"));
         assert_eq!(status[2].fg, Color::LightRed);
@@ -571,7 +629,7 @@ mod tests {
         app.store.add_study(today, "rust", 480)?;
         app.reload()?;
         terminal.draw(|frame| ui::draw(frame, &app))?;
-        let status = &terminal.backend().buffer().content()[240..320];
+        let status = &terminal.backend().buffer().content()[row_start..row_start + 80];
         let text: String = status.iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains("This week · Ahead by"));
         assert_eq!(status[2].fg, Color::Green);
@@ -633,16 +691,25 @@ mod tests {
     fn dashboard_can_start_and_stop_a_recovered_timer() -> Result<()> {
         let directory = storage::tests::temporary_directory();
         let database = directory.join("kronos.sqlite3");
-        let mut store = Store::create_new(&database)?;
-        store.add_topic("rust")?;
+        let store = Store::create_new(&database)?;
         let mut app = App::new(store)?;
-        let timer_key = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
-        app.handle_key(timer_key)?;
+        let press = |app: &mut App, code| app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        press(&mut app, KeyCode::Enter)?;
         assert!(app.screen == Screen::TimerTopicSelect);
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+        press(&mut app, KeyCode::Enter)?;
+        assert!(app.screen == Screen::AddTopic);
+        press(&mut app, KeyCode::Esc)?;
+        assert!(app.screen == Screen::TimerTopicSelect);
+        for ch in "Rust".chars() {
+            press(&mut app, KeyCode::Char(ch))?;
+        }
+        press(&mut app, KeyCode::Enter)?;
+        assert_eq!(app.topic_input, "Rust");
+        press(&mut app, KeyCode::Enter)?;
         assert!(app.screen == Screen::Dashboard);
         let id = app.active_timer.as_ref().unwrap().id;
-        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))?;
+        press(&mut app, KeyCode::Right)?;
+        press(&mut app, KeyCode::Enter)?;
         assert!(app.quit);
         drop(app);
 
@@ -659,9 +726,10 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(prompt.contains("Continue the running timer"));
-        assert!(prompt.contains("y Continue   n Discard   Esc Quit"));
+        assert!(prompt.contains("y Continue   n Discard"));
+        assert!(prompt.contains("Esc Quit"));
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))?;
+        press(&mut app, KeyCode::Enter)?;
         assert!(app.screen == Screen::Dashboard);
         assert_eq!(app.active_timer.as_ref().unwrap().id, id);
         terminal.draw(|frame| ui::draw(frame, &app))?;
@@ -685,7 +753,7 @@ mod tests {
             assert_eq!(app.active_timer.as_ref().unwrap().id, id);
         }
 
-        app.handle_key(timer_key)?;
+        press(&mut app, KeyCode::Enter)?;
         assert!(app.active_timer.is_none());
         assert!(app.store.active_timer()?.is_none());
 
@@ -695,7 +763,8 @@ mod tests {
         drop(app);
         let mut app = App::new(Store::open_existing(&database)?)?;
         assert!(app.screen == Screen::ResumeTimer);
-        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))?;
+        press(&mut app, KeyCode::Right)?;
+        press(&mut app, KeyCode::Enter)?;
         assert!(app.screen == Screen::Dashboard);
         assert!(app.store.active_timer()?.is_none());
         assert_eq!(app.store.load_current()?, before_discard);
@@ -744,54 +813,58 @@ mod tests {
             .collect();
         assert!(!dashboard.contains("design"));
 
-        press(&mut app, KeyCode::Char('a'))?;
+        press(&mut app, KeyCode::Down)?;
+        press(&mut app, KeyCode::Enter)?;
         terminal.draw(|frame| ui::draw(frame, &app))?;
         assert_topic_rows(&terminal, &["chemistry", "algebra", "biology", "design"]);
 
         press(&mut app, KeyCode::Enter)?;
         assert_eq!(app.study_date, today);
+        assert!(app.screen == Screen::Duration);
+        assert!(press(&mut app, KeyCode::Enter).is_err());
+        for ch in "1h 30m".chars() {
+            press(&mut app, KeyCode::Char(ch))?;
+        }
+        press(&mut app, KeyCode::Tab)?;
+        press(&mut app, KeyCode::Enter)?;
+        assert!(app.screen == Screen::DateSelect);
         press(&mut app, KeyCode::Up)?;
-        assert_eq!(app.study_date, today);
+        assert_eq!(app.date_draft, today);
 
-        app.study_date = NaiveDate::from_ymd_opt(2023, 12, 31).unwrap();
+        app.date_draft = NaiveDate::from_ymd_opt(2023, 12, 31).unwrap();
         press(&mut app, KeyCode::Up)?;
-        assert_eq!(app.study_date, NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
+        assert_eq!(app.date_draft, NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
         press(&mut app, KeyCode::Down)?;
         assert_eq!(
-            app.study_date,
+            app.date_draft,
             NaiveDate::from_ymd_opt(2023, 12, 31).unwrap()
         );
         press(&mut app, KeyCode::Right)?;
         press(&mut app, KeyCode::Up)?;
         assert_eq!(
-            app.study_date,
+            app.date_draft,
             NaiveDate::from_ymd_opt(2024, 1, 31).unwrap()
         );
         press(&mut app, KeyCode::Up)?;
         assert_eq!(
-            app.study_date,
+            app.date_draft,
             NaiveDate::from_ymd_opt(2024, 2, 29).unwrap()
         );
         press(&mut app, KeyCode::Right)?;
         press(&mut app, KeyCode::Down)?;
         assert_eq!(
-            app.study_date,
+            app.date_draft,
             NaiveDate::from_ymd_opt(2023, 2, 28).unwrap()
         );
 
-        for key in [
-            KeyCode::Esc,
-            KeyCode::Enter,
-            KeyCode::Enter,
-            KeyCode::Up,
-            KeyCode::Enter,
-        ] {
-            press(&mut app, key)?;
-        }
-        assert_eq!(aggregate_current(&app.current)["chemistry"], 120 * 60_000);
+        press(&mut app, KeyCode::Esc)?;
+        assert_eq!(app.study_date, today);
+        press(&mut app, KeyCode::Tab)?;
+        press(&mut app, KeyCode::Enter)?;
+        assert_eq!(aggregate_current(&app.current)["chemistry"], 150 * 60_000);
 
         press(&mut app, KeyCode::Char('a'))?;
-        for key in [KeyCode::Char('I'), KeyCode::Char('x'), KeyCode::Enter] {
+        for key in [KeyCode::Char('I'), KeyCode::Char('x')] {
             press(&mut app, key)?;
         }
         assert!(matches!(app.screen, Screen::TopicSelect));
@@ -804,15 +877,12 @@ mod tests {
         );
         terminal.draw(|frame| ui::draw(frame, &app))?;
         assert_topic_rows(&terminal, &["chemistry", "biology", "design"]);
-        for key in [
-            KeyCode::Down,
-            KeyCode::Enter,
-            KeyCode::Enter,
-            KeyCode::Up,
-            KeyCode::Enter,
-        ] {
-            press(&mut app, key)?;
+        press(&mut app, KeyCode::Down)?;
+        press(&mut app, KeyCode::Enter)?;
+        for ch in "60".chars() {
+            press(&mut app, KeyCode::Char(ch))?;
         }
+        press(&mut app, KeyCode::Enter)?;
         assert_eq!(aggregate_current(&app.current)["biology"], 80 * 60_000);
 
         press(&mut app, KeyCode::Char('h'))?;
@@ -827,6 +897,36 @@ mod tests {
         assert_eq!(app.history_index, 1);
         press(&mut app, KeyCode::Right)?;
         assert_eq!(app.history_index, 0);
+
+        press(&mut app, KeyCode::Esc)?;
+        press(&mut app, KeyCode::Char('a'))?;
+        for ch in "physics".chars() {
+            press(&mut app, KeyCode::Char(ch))?;
+        }
+        press(&mut app, KeyCode::Enter)?;
+        press(&mut app, KeyCode::Enter)?;
+        assert_eq!(app.study_topic, "physics");
+        for ch in "45m".chars() {
+            press(&mut app, KeyCode::Char(ch))?;
+        }
+        press(&mut app, KeyCode::Tab)?;
+        press(&mut app, KeyCode::Enter)?;
+        press(&mut app, KeyCode::Down)?;
+        press(&mut app, KeyCode::Enter)?;
+        assert_eq!(app.study_date, today - Duration::days(1));
+        assert_eq!(app.duration_input, "45m");
+        press(&mut app, KeyCode::Tab)?;
+        press(&mut app, KeyCode::Enter)?;
+        let (entries, _, _) = app.store.load_study_snapshot()?;
+        assert!(
+            entries.iter().any(|entry| entry.topic == "physics"
+                && entry.date == today - Duration::days(1)
+                && entry.duration_ms == 45 * 60_000)
+                || app.history.iter().any(|entry| entry.topic == "physics"
+                    && entry.minutes == 45
+                    && (entry.iso_year, entry.iso_week)
+                        == model::iso_week_key(today - Duration::days(1)))
+        );
 
         drop(app);
         std::fs::remove_file(database)?;
@@ -844,12 +944,5 @@ mod tests {
             })
             .collect();
         assert_eq!(visible_topics, expected);
-    }
-
-    #[test]
-    fn duration_step_cycles_through_one_five_and_fifteen_minutes() {
-        assert_eq!(next_step(1), 5);
-        assert_eq!(next_step(5), 15);
-        assert_eq!(next_step(15), 1);
     }
 }
