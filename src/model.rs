@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 pub struct CurrentEntry {
     pub date: NaiveDate,
     pub topic: String,
-    pub minutes: u32,
+    pub duration_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,10 +30,10 @@ pub fn current_week(today: NaiveDate) -> NaiveDate {
     week_start(today)
 }
 
-pub fn aggregate_current(entries: &[CurrentEntry]) -> BTreeMap<String, u32> {
+pub fn aggregate_current(entries: &[CurrentEntry]) -> BTreeMap<String, u64> {
     let mut totals = BTreeMap::new();
     for entry in entries {
-        *totals.entry(entry.topic.clone()).or_insert(0) += entry.minutes;
+        *totals.entry(entry.topic.clone()).or_insert(0) += entry.duration_ms;
     }
     totals
 }
@@ -76,17 +76,17 @@ mod tests {
             CurrentEntry {
                 date: monday,
                 topic: "java".into(),
-                minutes: 90,
+                duration_ms: 90,
             },
             CurrentEntry {
                 date: monday + Duration::days(1),
                 topic: "java".into(),
-                minutes: 30,
+                duration_ms: 30,
             },
             CurrentEntry {
                 date: monday,
                 topic: "design".into(),
-                minutes: 45,
+                duration_ms: 45,
             },
         ];
         let totals = aggregate_current(&entries);
