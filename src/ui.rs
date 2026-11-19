@@ -2,80 +2,106 @@ mod dashboard;
 pub(crate) mod goals;
 mod history;
 pub(crate) mod setup;
-mod study_entry;
+pub(crate) mod study_entry;
 
 use crate::{App, Screen};
 use chrono::Utc;
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::{Block, Paragraph, Wrap},
 };
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(3),
-        ])
-        .split(frame.area());
-
-    let running = app.active_timer.is_some() && app.screen != Screen::ResumeTimer;
-    let title = match &app.active_timer {
-        Some(timer) if running => {
-            let seconds = timer.elapsed_seconds(Utc::now());
-            format!(
-                " ● Timer running {:02}:{:02}:{:02} · {} ",
-                seconds / 3600,
-                seconds / 60 % 60,
-                seconds % 60,
-                timer.topic
-            )
+    if app.screen != Screen::ResumeTimer
+        && let Some(timer) = &app.active_timer
+    {
+        let seconds = timer.elapsed_seconds(Utc::now());
+        let clock = format_duration(seconds as u64 * 1000);
+        let mut lines = vec![
+            Line::from(format!("Timer running · {}", timer.topic)),
+            Line::from(clock),
+            Line::default(),
+            choice_line("m Stop", "q Quit", app.timer_quit),
+        ];
+        if !app.message.is_empty() {
+            lines.push(Line::from(app.message.as_str()));
         }
-        _ => concat!(" kronos v", env!("CARGO_PKG_VERSION"), " ").into(),
-    };
-    let title_style = if running {
-        Style::default().fg(Color::Black).bg(Color::LightRed)
-    } else {
-        Style::default().fg(Color::Cyan)
-    };
-    let title = Paragraph::new(title)
-        .style(title_style.add_modifier(Modifier::BOLD))
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(title, areas[0]);
+        let timer_view = Paragraph::new(lines).centered().wrap(Wrap { trim: true });
+        frame.render_widget(timer_view, frame.area());
+        return;
+    }
+
+    let [title, content, status, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(u16::from(!app.message.is_empty())),
+        Constraint::Length(2),
+    ])
+    .areas(frame.area());
+
+    frame.render_widget(
+        Paragraph::new("Kronos").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        title,
+    );
 
     match app.screen {
-        Screen::Dashboard => dashboard::draw(frame, app, areas[1]),
+        Screen::Dashboard => dashboard::draw(frame, app, content),
         Screen::ResumeTimer => {
             if let Some(timer) = &app.active_timer {
-                let prompt = Paragraph::new(format!(
-                    "Continue the running timer for \"{}\"?\nDiscarding deletes the session without adding study time.",
-                    timer.topic
-                ))
+                let prompt = Paragraph::new(vec![
+                    Line::from(format!(
+                        "Continue the running timer for \"{}\"?",
+                        timer.topic
+                    )),
+                    Line::from("Discarding deletes the session without adding study time."),
+                    Line::default(),
+                    choice_line("y Continue", "n Discard", app.resume_discard),
+                ])
                 .wrap(Wrap { trim: true })
                 .block(Block::bordered().title("Resume study timer"));
-                frame.render_widget(prompt, areas[1]);
+                frame.render_widget(prompt, content);
             }
         }
         Screen::TopicSelect | Screen::TimerTopicSelect => {
-            study_entry::draw_topic_select(frame, app, areas[1])
+            study_entry::draw_topic_select(frame, app, content)
         }
-        Screen::DateSelect => study_entry::draw_date_select(frame, app, areas[1]),
-        Screen::Duration => study_entry::draw_duration(frame, app, areas[1]),
-        Screen::AddTopic => study_entry::draw_add_topic(frame, &app.topic_input, areas[1]),
-        Screen::History => history::draw(frame, app, areas[1]),
-        Screen::GoalProgress => goals::draw_progress(frame, &app.goal_progress, areas[1]),
-        Screen::EditGoal => goals::draw_editor(frame, &app.goal_input, areas[1]),
+        Screen::DateSelect => study_entry::draw_date_select(frame, app, content),
+        Screen::Duration => study_entry::draw_duration(frame, app, content),
+        Screen::AddTopic => study_entry::draw_add_topic(frame, app, content),
+        Screen::History => history::draw(frame, app, content),
+        Screen::GoalProgress => goals::draw_progress(frame, &app.goal_progress, content),
+        Screen::EditGoal => goals::draw_editor(frame, &app.goal_input, content),
     }
 
-    let help = help_text(app);
-    let footer = Paragraph::new(help)
-        .style(Style::default().fg(Color::Gray))
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(footer, areas[2]);
+    if !app.message.is_empty() {
+        frame.render_widget(
+            Paragraph::new(app.message.as_str()).style(Style::default().fg(Color::Yellow)),
+            status,
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(help_text(app.screen))
+            .style(Style::default().fg(Color::Gray))
+            .wrap(Wrap { trim: true }),
+        footer,
+    );
+}
+
+fn choice_line<'a>(left: &'a str, right: &'a str, right_selected: bool) -> Line<'a> {
+    let selected = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    let normal = Style::default();
+    Line::from(vec![
+        Span::styled(left, if right_selected { normal } else { selected }),
+        Span::raw("   "),
+        Span::styled(right, if right_selected { selected } else { normal }),
+    ])
 }
 
 pub(crate) fn format_duration(duration_ms: u64) -> String {
@@ -94,36 +120,17 @@ pub(crate) fn format_duration(duration_ms: u64) -> String {
     }
 }
 
-fn help_text(app: &App) -> String {
-    if !app.message.is_empty() && app.screen != Screen::Dashboard {
-        return format!(" Error: {} ", app.message);
-    }
-    match app.screen {
-        Screen::ResumeTimer => " y Continue   n Discard   Esc Quit ".into(),
-        Screen::Dashboard => {
-            if app.message.is_empty() {
-                let timer_action = if app.active_timer.is_some() {
-                    "Stop"
-                } else {
-                    "Start"
-                };
-                format!(
-                    " m {timer_action} timer   a Add time   t Add topic   h History   g Goals   q Quit "
-                )
-            } else {
-                format!(" {} ", app.message)
-            }
-        }
-        Screen::TopicSelect | Screen::TimerTopicSelect => {
-            " Type to filter   ↑↓ Navigate   Enter Confirm   Esc Back ".into()
-        }
-        Screen::DateSelect => " ←→ Day/Month/Year   ↑↓ Adjust   Enter Confirm   Esc Back ".into(),
-        Screen::AddTopic => " Type   Backspace Delete   Enter Confirm   Esc Cancel ".into(),
-        Screen::Duration => {
-            " ←→ Field   ↑↓ Adjust   s Step 1/5/15m   Enter Save   Esc Back ".into()
-        }
-        Screen::History => " ←→ Previous/next week   Esc Back to dashboard ".into(),
-        Screen::GoalProgress => " e Set weekly goal   Esc Back ".into(),
-        Screen::EditGoal => " Enter Save   Esc Cancel ".into(),
+fn help_text(screen: Screen) -> &'static str {
+    match screen {
+        Screen::ResumeTimer => "←→ Select · Enter Confirm · Esc Quit",
+        Screen::Dashboard => "↑↓ Select · Enter Open · PgUp/PgDn Scroll study time",
+        Screen::TimerTopicSelect => "Type to search · ↑↓ Select · Enter Start or create · Esc Back",
+        Screen::TopicSelect => "Type to search · ↑↓ Select · Enter Open · Esc Back",
+        Screen::DateSelect => "←→ Day, month, year · ↑↓ Adjust · Enter Apply · Esc Cancel",
+        Screen::AddTopic => "Enter Confirm · Esc Back",
+        Screen::Duration => "Tab Change field · Enter Confirm · Esc Back",
+        Screen::History => "← Older week · → Newer week · Esc Back",
+        Screen::GoalProgress => "Enter Set weekly goal · Esc Back",
+        Screen::EditGoal => "Enter Save · Esc Back",
     }
 }
