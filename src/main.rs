@@ -65,6 +65,7 @@ struct App {
     history_weeks: Vec<(i32, u32)>,
     history_index: usize,
     goal_progress: GoalProgress,
+    snapshot_date: NaiveDate,
     goal_input: String,
     message: String,
     quit: bool,
@@ -93,6 +94,7 @@ impl App {
             history_weeks: Vec::new(),
             history_index: 0,
             goal_progress: GoalProgress::NoGoal,
+            snapshot_date: today,
             goal_input: String::new(),
             message: String::new(),
             quit: false,
@@ -121,6 +123,8 @@ impl App {
         self.topics
             .sort_by_key(|topic| Reverse(totals.get(topic).copied().unwrap_or(0)));
         self.history = self.store.load_history()?;
+        self.goal_progress = self.store.goal_progress(today)?;
+        self.snapshot_date = today;
         self.history_weeks = self
             .history
             .iter()
@@ -465,6 +469,11 @@ fn run(mut app: App) -> Result<()> {
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     while !app.quit {
+        if matches!(app.screen, Screen::Dashboard | Screen::GoalProgress)
+            && app.snapshot_date != Local::now().date_naive()
+        {
+            app.reload()?;
+        }
         terminal.draw(|frame| draw(frame, app))?;
         if event::poll(StdDuration::from_millis(200))?
             && let Event::Key(key) = event::read()?
@@ -585,6 +594,14 @@ fn format_goal_duration(duration_ms: u64, show_days: bool) -> String {
     }
 }
 
+fn goal_balance(studied_ms: u64, expected_ms: u64) -> (&'static str, Color) {
+    match studied_ms.cmp(&expected_ms) {
+        std::cmp::Ordering::Greater => ("Ahead by", Color::Green),
+        std::cmp::Ordering::Less => ("Behind by", Color::LightRed),
+        std::cmp::Ordering::Equal => ("On track", Color::Green),
+    }
+}
+
 fn draw_goal_progress(
     frame: &mut ratatui::Frame<'_>,
     progress: &GoalProgress,
@@ -611,10 +628,11 @@ fn draw_goal_progress(
                 let equivalent_weeks = difference_ms as f64 / weekly_goal_ms as f64;
                 difference.push_str(&format!(" (~{equivalent_weeks:.1} weeks at current goal)"));
             }
-            let (status, color) = match studied_ms.cmp(expected_ms) {
-                std::cmp::Ordering::Greater => (format!("Ahead by {difference}"), Color::Green),
-                std::cmp::Ordering::Less => (format!("Behind by {difference}"), Color::LightRed),
-                std::cmp::Ordering::Equal => ("On track".into(), Color::Green),
+            let (label, color) = goal_balance(*studied_ms, *expected_ms);
+            let status = if difference_ms == 0 {
+                label.to_owned()
+            } else {
+                format!("{label} {difference}")
             };
             let mut lines = vec![
                 Line::from(format!("Plan since {starts_on}")),
@@ -658,11 +676,31 @@ fn draw_goal_progress(
 }
 
 fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
-    let today = Local::now().date_naive();
+    let today = app.snapshot_date;
     let start = week_start(today);
     let (iso_year, iso_week) = iso_week_key(today);
     let totals = aggregate_current(&app.current);
     let total: u64 = totals.values().sum();
+    let area = if let GoalProgress::Started { current_goal, .. } = app.goal_progress {
+        let days_elapsed = (today - start).num_days() as u64 + 1;
+        let expected_ms = u64::from(current_goal.minutes_per_week) * 60_000 * days_elapsed / 7;
+        let (label, color) = goal_balance(total, expected_ms);
+        let balance = if total == expected_ms {
+            format!("  This week · {label}")
+        } else {
+            let difference = format_goal_duration(total.abs_diff(expected_ms), false);
+            format!("  This week · {label} {difference}")
+        };
+        let [status, study_list] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        frame.render_widget(
+            Paragraph::new(balance).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            status,
+        );
+        study_list
+    } else {
+        area
+    };
     let rows = app
         .topics
         .iter()
@@ -930,6 +968,44 @@ mod tests {
     use chrono::Duration;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn dashboard_colors_the_weekly_balance_independently_of_the_plan_balance() -> Result<()> {
+        let directory = storage::tests::temporary_directory();
+        let mut store = Store::create_new(&directory.join("kronos.sqlite3"))?;
+        let today = Local::now().date_naive();
+        let previous_monday = week_start(today) - Duration::weeks(1);
+        store.add_topic("rust")?;
+        store.save_weekly_goal(WeeklyGoal {
+            starts_on: previous_monday,
+            minutes_per_week: 420,
+        })?;
+        store.add_study(previous_monday, "rust", 900)?;
+        let mut app = App::new(store)?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 16))?;
+
+        assert!(
+            matches!(app.goal_progress, GoalProgress::Started { studied_ms, expected_ms, .. }
+            if studied_ms > expected_ms)
+        );
+        terminal.draw(|frame| draw(frame, &app))?;
+        let status = &terminal.backend().buffer().content()[240..320];
+        let text: String = status.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("This week · Behind by"));
+        assert_eq!(status[2].fg, Color::LightRed);
+
+        app.store.add_study(today, "rust", 480)?;
+        app.reload()?;
+        terminal.draw(|frame| draw(frame, &app))?;
+        let status = &terminal.backend().buffer().content()[240..320];
+        let text: String = status.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("This week · Ahead by"));
+        assert_eq!(status[2].fg, Color::Green);
+
+        drop(app);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
 
     #[test]
     fn weekly_goal_can_be_configured_from_progress_and_survives_reopening() -> Result<()> {
