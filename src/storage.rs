@@ -1,15 +1,17 @@
+mod migrations;
+
 use crate::model::{CurrentEntry, HistoryEntry, current_week, iso_week_key, week_start};
 use anyhow::{Context, Result, bail};
 use chrono::{Local, NaiveDate, Weekday};
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     time::Duration,
 };
-
-const DATABASE_APPLICATION_ID: i64 = 0x5354_5544;
 
 pub struct Store {
     connection: Connection,
@@ -51,7 +53,8 @@ impl Store {
                 Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
                     .with_context(|| format!("Could not open database {}", path.display()))?;
             configure_connection(&connection)?;
-            create_schema(&mut connection)?;
+            migrations::create_schema(&mut connection)
+                .context("Could not initialize the SQLite database")?;
             Ok(Self { connection })
         })();
         match result {
@@ -75,10 +78,11 @@ impl Store {
         if !path.is_file() {
             bail!("Database file does not exist: {}", path.display());
         }
-        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .with_context(|| format!("Could not open database {}", path.display()))?;
+        let mut connection =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .with_context(|| format!("Could not open database {}", path.display()))?;
         configure_connection(&connection)?;
-        verify_schema(&connection)?;
+        migrations::apply_pending(&mut connection)?;
 
         Ok(Self { connection })
     }
@@ -114,7 +118,9 @@ impl Store {
 
     pub fn load_current(&self) -> Result<Vec<CurrentEntry>> {
         let mut statement = self.connection.prepare(
-            "SELECT date, topic, minutes FROM daily_entries ORDER BY date, topic COLLATE NOCASE",
+            "SELECT daily_entries.date, topics.name, daily_entries.minutes
+             FROM daily_entries JOIN topics ON topics.id = daily_entries.topic_id
+             ORDER BY daily_entries.date, topics.name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -136,9 +142,9 @@ impl Store {
 
     pub fn load_history(&self) -> Result<Vec<HistoryEntry>> {
         let mut statement = self.connection.prepare(
-            "SELECT iso_year, iso_week, topic, minutes
-             FROM weekly_totals
-             ORDER BY iso_year DESC, iso_week DESC, topic COLLATE NOCASE",
+            "SELECT weekly_totals.iso_year, weekly_totals.iso_week, topics.name, weekly_totals.minutes
+             FROM weekly_totals JOIN topics ON topics.id = weekly_totals.topic_id
+             ORDER BY weekly_totals.iso_year DESC, weekly_totals.iso_week DESC, topics.name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -173,27 +179,25 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let topic_exists: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM topics WHERE name = ?1)",
-            [topic],
-            |row| row.get(0),
-        )?;
-        if !topic_exists {
-            bail!("Topic \"{topic}\" does not exist");
-        }
+        let topic_id: i64 = transaction
+            .query_row("SELECT id FROM topics WHERE name = ?1", [topic], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .with_context(|| format!("Topic \"{topic}\" does not exist"))?;
 
         finalize_completed_weeks(&transaction, today)?;
         let minutes = i64::from(minutes);
         if week_start(date) == current_week(today) {
             transaction.execute(
-                "INSERT INTO daily_entries(date, topic, minutes)
+                "INSERT INTO daily_entries(date, topic_id, minutes)
                  VALUES (?1, ?2, ?3)
-                 ON CONFLICT(date, topic)
+                 ON CONFLICT(date, topic_id)
                  DO UPDATE SET minutes = daily_entries.minutes + excluded.minutes",
-                params![date.to_string(), topic, minutes],
+                params![date.to_string(), topic_id, minutes],
             )?;
         } else {
-            add_weekly_minutes(&transaction, date, topic, minutes)?;
+            add_weekly_minutes(&transaction, iso_week_key(date), topic_id, minutes)?;
         }
         transaction.commit()?;
         Ok(())
@@ -215,132 +219,36 @@ fn configure_connection(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn create_schema(connection: &mut Connection) -> Result<()> {
-    connection
-        .execute_batch(&format!(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE topics (
-                 name TEXT PRIMARY KEY COLLATE NOCASE
-             );
-             CREATE TABLE daily_entries (
-                 date TEXT NOT NULL,
-                 topic TEXT NOT NULL COLLATE NOCASE,
-                 minutes INTEGER NOT NULL CHECK (minutes BETWEEN 1 AND 4294967295),
-                 PRIMARY KEY (date, topic),
-                 FOREIGN KEY (topic) REFERENCES topics(name)
-             );
-             CREATE TABLE weekly_totals (
-                 iso_year INTEGER NOT NULL,
-                 iso_week INTEGER NOT NULL CHECK (iso_week BETWEEN 1 AND 53),
-                 topic TEXT NOT NULL COLLATE NOCASE,
-                 minutes INTEGER NOT NULL CHECK (minutes BETWEEN 1 AND 4294967295),
-                 PRIMARY KEY (iso_year, iso_week, topic),
-                 FOREIGN KEY (topic) REFERENCES topics(name)
-             );
-             PRAGMA application_id = {DATABASE_APPLICATION_ID};
-             COMMIT;"
-        ))
-        .context("Could not initialize the SQLite database")?;
-    Ok(())
-}
-
-fn verify_schema(connection: &Connection) -> Result<()> {
-    let quick_check: String =
-        connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
-    if quick_check != "ok" {
-        bail!("Database integrity check failed: {quick_check}");
-    }
-
-    let application_id: i64 =
-        connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
-    if application_id != DATABASE_APPLICATION_ID {
-        bail!("This file is not a Kronos database (application ID {application_id})");
-    }
-
-    let expected_tables = ["daily_entries", "topics", "weekly_totals"];
-    let expected_columns: &[(&str, &[(&str, &str)])] = &[
-        ("topics", &[("name", "TEXT")]),
-        (
-            "daily_entries",
-            &[("date", "TEXT"), ("topic", "TEXT"), ("minutes", "INTEGER")],
-        ),
-        (
-            "weekly_totals",
-            &[
-                ("iso_year", "INTEGER"),
-                ("iso_week", "INTEGER"),
-                ("topic", "TEXT"),
-                ("minutes", "INTEGER"),
-            ],
-        ),
-    ];
-
-    let mut statement = connection.prepare(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-    )?;
-    let tables = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(statement);
-    if tables.iter().map(String::as_str).collect::<Vec<_>>() != expected_tables {
-        bail!("This file does not contain the expected Kronos tables");
-    }
-
-    for (table, expected) in expected_columns {
-        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-        let actual = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if actual
-            .iter()
-            .map(|(name, data_type)| (name.as_str(), data_type.as_str()))
-            .collect::<Vec<_>>()
-            != *expected
-        {
-            bail!("Database table \"{table}\" has an unexpected schema");
-        }
-    }
-    Ok(())
-}
-
 fn finalize_completed_weeks(transaction: &Transaction<'_>, today: NaiveDate) -> Result<()> {
     let cutoff = current_week(today).to_string();
     let stale_entries = {
         let mut statement = transaction.prepare(
-            "SELECT date, topic, minutes FROM daily_entries WHERE date < ?1 ORDER BY date, topic",
+            "SELECT date, topic_id, minutes FROM daily_entries WHERE date < ?1 ORDER BY date, topic_id",
         )?;
         let rows = statement.query_map([&cutoff], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
             ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    let mut totals = BTreeMap::<(i32, u32, String), u64>::new();
-    for (date, topic, minutes) in stale_entries {
+    let mut totals = BTreeMap::<(i32, u32, i64), u64>::new();
+    for (date, topic_id, minutes) in stale_entries {
         let date = parse_date(&date)?;
         let minutes = u64::try_from(minutes).context("Invalid daily minute total")?;
         let (iso_year, iso_week) = iso_week_key(date);
-        let total = totals.entry((iso_year, iso_week, topic)).or_default();
+        let total = totals.entry((iso_year, iso_week, topic_id)).or_default();
         *total = total
             .checked_add(minutes)
             .context("Weekly minute total is out of range")?;
     }
 
-    for ((iso_year, iso_week, topic), minutes) in totals {
+    for ((iso_year, iso_week, topic_id), minutes) in totals {
         let minutes = i64::try_from(minutes).context("Weekly minute total is out of range")?;
-        transaction.execute(
-            "INSERT INTO weekly_totals(iso_year, iso_week, topic, minutes)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(iso_year, iso_week, topic)
-             DO UPDATE SET minutes = weekly_totals.minutes + excluded.minutes",
-            params![iso_year, iso_week, topic, minutes],
-        )?;
+        add_weekly_minutes(transaction, (iso_year, iso_week), topic_id, minutes)?;
     }
     transaction.execute("DELETE FROM daily_entries WHERE date < ?1", [&cutoff])?;
     Ok(())
@@ -348,17 +256,16 @@ fn finalize_completed_weeks(transaction: &Transaction<'_>, today: NaiveDate) -> 
 
 fn add_weekly_minutes(
     transaction: &Transaction<'_>,
-    date: NaiveDate,
-    topic: &str,
+    (iso_year, iso_week): (i32, u32),
+    topic_id: i64,
     minutes: i64,
 ) -> Result<()> {
-    let (iso_year, iso_week) = iso_week_key(date);
     transaction.execute(
-        "INSERT INTO weekly_totals(iso_year, iso_week, topic, minutes)
+        "INSERT INTO weekly_totals(iso_year, iso_week, topic_id, minutes)
          VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(iso_year, iso_week, topic)
+         ON CONFLICT(iso_year, iso_week, topic_id)
          DO UPDATE SET minutes = weekly_totals.minutes + excluded.minutes",
-        params![iso_year, iso_week, topic, minutes],
+        params![iso_year, iso_week, topic_id, minutes],
     )?;
     Ok(())
 }
@@ -391,7 +298,7 @@ mod tests {
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
-    fn temporary_directory() -> PathBuf {
+    pub(super) fn temporary_directory() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "kronos-sqlite-test-{}-{}-{}",
             std::process::id(),
@@ -479,6 +386,28 @@ mod tests {
     }
 
     #[test]
+    fn study_entries_keep_their_topic_when_its_name_changes() {
+        let (mut store, directory) = temporary_store();
+        let today = Local::now().date_naive();
+        store.add_topic("rust").unwrap();
+        store.add_study(today, "rust", 30).unwrap();
+        store
+            .add_study(today - DateDuration::weeks(1), "rust", 45)
+            .unwrap();
+
+        store
+            .connection
+            .execute("UPDATE topics SET name = 'systems' WHERE name = 'rust'", [])
+            .unwrap();
+
+        assert_eq!(store.load_current().unwrap()[0].topic, "systems");
+        assert_eq!(store.load_history().unwrap()[0].topic, "systems");
+
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn rollover_aggregates_every_stale_week_atomically() {
         let (mut store, directory) = temporary_store();
         store.add_topic("java").unwrap();
@@ -492,7 +421,7 @@ mod tests {
             store
                 .connection
                 .execute(
-                    "INSERT INTO daily_entries(date, topic, minutes) VALUES (?1, 'java', ?2)",
+                    "INSERT INTO daily_entries(date, topic_id, minutes) SELECT ?1, id, ?2 FROM topics WHERE name = 'java'",
                     params![date.to_string(), minutes],
                 )
                 .unwrap();
@@ -557,7 +486,7 @@ mod tests {
         store
             .connection
             .execute(
-                "INSERT INTO daily_entries(date, topic, minutes) VALUES (?1, 'java', 60)",
+                "INSERT INTO daily_entries(date, topic_id, minutes) SELECT ?1, id, 60 FROM topics WHERE name = 'java'",
                 [old_monday.to_string()],
             )
             .unwrap();

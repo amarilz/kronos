@@ -27,15 +27,19 @@ KRONOS_DB_PATH=/absolute/path/to/kronos.sqlite3 kronos
 
 The database contains:
 
-- `topics`: user-defined topic names.
+- `topics`: user-defined topic names with an integer primary key, `id`.
 - `daily_entries`: dated entries for the open week.
 - `weekly_totals`: completed and retroactively updated weekly aggregates.
+
+Both entry tables reference `topics.id` through `topic_id`.
+When opening an older Kronos database that uses topic names as keys, Kronos
+assigns topic IDs and updates the entry references in a single transaction.
 
 Completed weeks are identified by the **ISO year and ISO week number**, stored
 as `iso_year` and `iso_week`. Together they uniquely identify a week, including
 at year boundaries: for example, Monday 30 December 2024 belongs to ISO week
 `2025-W01`. A topic's weekly total is uniquely keyed by
-`(iso_year, iso_week, topic)`.
+`(iso_year, iso_week, topic_id)`.
 
 The app rolls over every stale daily week on startup and in the same SQLite
 transaction as each new study entry. An entry from several months ago updates
