@@ -137,6 +137,27 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         self.message.clear();
+        if self.screen != Screen::ResumeTimer
+            && let Some(timer) = &self.active_timer
+        {
+            match key.code {
+                KeyCode::Char('m') if key.kind == KeyEventKind::Press => {
+                    let result = self.store.stop_timer(timer.id, Utc::now())?;
+                    self.screen = Screen::Dashboard;
+                    self.reload()?;
+                    self.message = match result {
+                        Some(duration_ms) => {
+                            format!("Timer saved · {}", ui::format_duration(duration_ms as u64))
+                        }
+                        None => "This timer was already stopped".into(),
+                    };
+                }
+                KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+                _ => {}
+            }
+            return Ok(());
+        }
+
         match self.screen {
             Screen::ResumeTimer => match key.code {
                 KeyCode::Char('y' | 'Y' | 'n' | 'N') if key.kind == KeyEventKind::Press => {
@@ -159,22 +180,11 @@ impl App {
             Screen::Dashboard => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
                 KeyCode::Char('m') if key.kind == KeyEventKind::Press => {
-                    if let Some(timer) = &self.active_timer {
-                        let result = self.store.stop_timer(timer.id, Utc::now())?;
-                        self.reload()?;
-                        self.message = match result {
-                            Some(duration_ms) => {
-                                format!("Timer saved · {}", ui::format_duration(duration_ms as u64))
-                            }
-                            None => "This timer was already stopped".into(),
-                        };
-                    } else {
-                        self.reload()?;
-                        if self.active_timer.is_none() {
-                            self.topic_filter.clear();
-                            self.selected = 0;
-                            self.screen = Screen::TimerTopicSelect;
-                        }
+                    self.reload()?;
+                    if self.active_timer.is_none() {
+                        self.topic_filter.clear();
+                        self.selected = 0;
+                        self.screen = Screen::TimerTopicSelect;
                     }
                 }
                 KeyCode::Char('a') => {
@@ -632,25 +642,48 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
         assert!(app.screen == Screen::Dashboard);
         let id = app.active_timer.as_ref().unwrap().id;
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))?;
+        assert!(app.quit);
         drop(app);
 
         let mut app = App::new(Store::open_existing(&database)?)?;
         assert_eq!(app.active_timer.as_ref().unwrap().id, id);
         assert!(app.screen == Screen::ResumeTimer);
+        let mut terminal = Terminal::new(TestBackend::new(80, 16))?;
+        terminal.draw(|frame| ui::draw(frame, &app))?;
+        let prompt: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(prompt.contains("Continue the running timer"));
+        assert!(prompt.contains("y Continue   n Discard   Esc Quit"));
+
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))?;
         assert!(app.screen == Screen::Dashboard);
         assert_eq!(app.active_timer.as_ref().unwrap().id, id);
-        let mut terminal = Terminal::new(TestBackend::new(80, 16))?;
         terminal.draw(|frame| ui::draw(frame, &app))?;
-        let title = terminal.backend().buffer().content()[80..160]
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(title.contains("Timer running") && title.contains("rust"));
-        assert_eq!(
-            terminal.backend().buffer().content()[82].bg,
-            Color::LightRed
-        );
+        let rows: Vec<_> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .map(|row| row.trim().to_owned())
+            .filter(|row| !row.is_empty())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].starts_with("Timer running · rust"));
+        assert_eq!(rows[1].split(':').count(), 3);
+        assert_eq!(rows[2], "m Stop   q Quit");
+
+        for shortcut in ['a', 't', 'h', 'g', 'n'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(shortcut), KeyModifiers::NONE))?;
+            assert!(app.screen == Screen::Dashboard);
+            assert_eq!(app.active_timer.as_ref().unwrap().id, id);
+        }
 
         app.handle_key(timer_key)?;
         assert!(app.active_timer.is_none());

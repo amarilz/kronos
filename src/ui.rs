@@ -14,6 +14,24 @@ use ratatui::{
 };
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
+    if app.screen != Screen::ResumeTimer
+        && let Some(timer) = &app.active_timer
+    {
+        let seconds = timer.elapsed_seconds(Utc::now());
+        let clock = format_duration(seconds as u64 * 1000);
+        let mut timer_view = format!(
+            "Timer running · {}\n{clock}\n\nm Stop   q Quit",
+            timer.topic
+        );
+        if !app.message.is_empty() {
+            timer_view.push_str("\n");
+            timer_view.push_str(&app.message);
+        }
+        let timer_view = Paragraph::new(timer_view).centered();
+        frame.render_widget(timer_view, frame.area());
+        return;
+    }
+
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -23,27 +41,12 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         ])
         .split(frame.area());
 
-    let running = app.active_timer.is_some() && app.screen != Screen::ResumeTimer;
-    let title = match &app.active_timer {
-        Some(timer) if running => {
-            let seconds = timer.elapsed_seconds(Utc::now());
-            format!(
-                " ● Timer running {:02}:{:02}:{:02} · {} ",
-                seconds / 3600,
-                seconds / 60 % 60,
-                seconds % 60,
-                timer.topic
-            )
-        }
-        _ => concat!(" kronos v", env!("CARGO_PKG_VERSION"), " ").into(),
-    };
-    let title_style = if running {
-        Style::default().fg(Color::Black).bg(Color::LightRed)
-    } else {
-        Style::default().fg(Color::Cyan)
-    };
-    let title = Paragraph::new(title)
-        .style(title_style.add_modifier(Modifier::BOLD))
+    let title = Paragraph::new(concat!(" kronos v", env!("CARGO_PKG_VERSION"), " "))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(title, areas[0]);
 
@@ -102,14 +105,7 @@ fn help_text(app: &App) -> String {
         Screen::ResumeTimer => " y Continue   n Discard   Esc Quit ".into(),
         Screen::Dashboard => {
             if app.message.is_empty() {
-                let timer_action = if app.active_timer.is_some() {
-                    "Stop"
-                } else {
-                    "Start"
-                };
-                format!(
-                    " m {timer_action} timer   a Add time   t Add topic   h History   g Goals   q Quit "
-                )
+                " m Start timer   a Add time   t Add topic   h History   g Goals   q Quit ".into()
             } else {
                 format!(" {} ", app.message)
             }
