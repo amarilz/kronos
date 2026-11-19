@@ -1,8 +1,10 @@
 mod migrations;
 
+const MILLIS_PER_MINUTE: i64 = 60_000;
+
 use crate::model::{CurrentEntry, HistoryEntry, current_week, iso_week_key, week_start};
 use anyhow::{Context, Result, bail};
-use chrono::{Local, NaiveDate, Weekday};
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc, Weekday};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
@@ -15,6 +17,21 @@ use std::{
 
 pub struct Store {
     connection: Connection,
+}
+
+pub struct ActiveTimer {
+    pub id: i64,
+    pub topic: String,
+    pub started_at: i64,
+}
+
+impl ActiveTimer {
+    pub fn elapsed_seconds(&self, now: DateTime<Utc>) -> i64 {
+        now.timestamp_millis()
+            .saturating_sub(self.started_at)
+            .max(0)
+            / 1000
+    }
 }
 
 impl Store {
@@ -53,7 +70,7 @@ impl Store {
                 Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
                     .with_context(|| format!("Could not open database {}", path.display()))?;
             configure_connection(&connection)?;
-            migrations::create_schema(&mut connection)
+            migrations::initialize_new_database(&mut connection)
                 .context("Could not initialize the SQLite database")?;
             Ok(Self { connection })
         })();
@@ -82,7 +99,7 @@ impl Store {
             Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
                 .with_context(|| format!("Could not open database {}", path.display()))?;
         configure_connection(&connection)?;
-        migrations::apply_pending(&mut connection)?;
+        migrations::upgrade_existing_database(&mut connection)?;
 
         Ok(Self { connection })
     }
@@ -118,8 +135,9 @@ impl Store {
 
     pub fn load_current(&self) -> Result<Vec<CurrentEntry>> {
         let mut statement = self.connection.prepare(
-            "SELECT daily_entries.date, topics.name, daily_entries.minutes
+            "SELECT daily_entries.date, topics.name, COALESCE(minutes * 60000, ended_at - started_at)
              FROM daily_entries JOIN topics ON topics.id = daily_entries.topic_id
+             WHERE minutes IS NOT NULL OR ended_at IS NOT NULL
              ORDER BY daily_entries.date, topics.name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], |row| {
@@ -130,11 +148,11 @@ impl Store {
             ))
         })?;
         rows.map(|row| {
-            let (date, topic, minutes) = row?;
+            let (date, topic, duration_ms) = row?;
             Ok(CurrentEntry {
                 date: parse_date(&date)?,
                 topic,
-                minutes: parse_minutes(minutes)?,
+                duration_ms: u64::try_from(duration_ms).context("Invalid study duration")?,
             })
         })
         .collect()
@@ -186,21 +204,122 @@ impl Store {
             .optional()?
             .with_context(|| format!("Topic \"{topic}\" does not exist"))?;
 
+        transaction.execute(
+            "INSERT INTO daily_entries(date, topic_id, minutes) VALUES (?1, ?2, ?3)",
+            params![date.to_string(), topic_id, minutes],
+        )?;
         finalize_completed_weeks(&transaction, today)?;
-        let minutes = i64::from(minutes);
-        if week_start(date) == current_week(today) {
-            transaction.execute(
-                "INSERT INTO daily_entries(date, topic_id, minutes)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(date, topic_id)
-                 DO UPDATE SET minutes = daily_entries.minutes + excluded.minutes",
-                params![date.to_string(), topic_id, minutes],
-            )?;
-        } else {
-            add_weekly_minutes(&transaction, iso_week_key(date), topic_id, minutes)?;
-        }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn active_timer(&self) -> Result<Option<ActiveTimer>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT daily_entries.id, topics.name, started_at
+             FROM daily_entries JOIN topics ON topics.id = daily_entries.topic_id
+             WHERE minutes IS NULL AND ended_at IS NULL",
+                [],
+                |row| {
+                    Ok(ActiveTimer {
+                        id: row.get(0)?,
+                        topic: row.get(1)?,
+                        started_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn start_timer(&self, topic: &str, now: DateTime<Utc>) -> Result<()> {
+        let inserted = self.connection.execute(
+            "INSERT INTO daily_entries(date, topic_id, started_at)
+             SELECT ?3, id, ?2 FROM topics WHERE name = ?1
+             ON CONFLICT DO NOTHING",
+            params![
+                topic,
+                now.timestamp_millis(),
+                now.with_timezone(&Local).date_naive().to_string()
+            ],
+        )?;
+        if inserted == 0 {
+            if self.active_timer()?.is_some() {
+                bail!("A study timer is already running");
+            }
+            bail!("Could not start a timer for \"{topic}\"");
+        }
+        Ok(())
+    }
+
+    pub fn discard_timer(&self, id: i64) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM daily_entries WHERE id = ?1 AND minutes IS NULL AND ended_at IS NULL",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn stop_timer(&mut self, id: i64, now: DateTime<Utc>) -> Result<Option<i64>> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some((topic_id, started_at, date)) = transaction
+            .query_row(
+                "SELECT topic_id, started_at, date FROM daily_entries
+             WHERE id = ?1 AND minutes IS NULL AND ended_at IS NULL",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let ended_at = now.timestamp_millis();
+        let elapsed = ended_at
+            .checked_sub(started_at)
+            .filter(|&ms| ms >= 0)
+            .context("The system clock is before the timer start")?;
+        let today = now.with_timezone(&Local).date_naive();
+        let start_date = parse_date(&date)?;
+        let mut date = start_date;
+        let mut portion_start = started_at;
+        loop {
+            let next_monday = week_start(date) + chrono::Duration::weeks(1);
+            let portion_end = if next_monday <= today {
+                local_week_boundary(next_monday)?
+                    .timestamp_millis()
+                    .clamp(portion_start, ended_at)
+            } else {
+                ended_at
+            };
+            if date == start_date {
+                transaction.execute(
+                    "UPDATE daily_entries SET ended_at = ?1 WHERE id = ?2",
+                    params![portion_end, id],
+                )?;
+            } else {
+                transaction.execute(
+                    "INSERT INTO daily_entries(date, topic_id, started_at, ended_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![date.to_string(), topic_id, portion_start, portion_end],
+                )?;
+            }
+            if portion_end == ended_at {
+                break;
+            }
+            date = next_monday;
+            portion_start = portion_end;
+        }
+        finalize_completed_weeks(&transaction, today)?;
+        transaction.commit()?;
+        Ok(Some(elapsed))
     }
 
     pub fn rollover_if_needed(&mut self, today: NaiveDate) -> Result<()> {
@@ -213,6 +332,18 @@ impl Store {
     }
 }
 
+fn local_week_boundary(monday: NaiveDate) -> Result<DateTime<Local>> {
+    let midnight = monday.and_hms_opt(0, 0, 0).unwrap();
+    // Some time zones skip or repeat local midnight.
+    (0..86_400)
+        .find_map(|seconds| {
+            Local
+                .from_local_datetime(&(midnight + chrono::Duration::seconds(seconds)))
+                .earliest()
+        })
+        .context("Could not resolve the start of the local week")
+}
+
 fn configure_connection(connection: &Connection) -> Result<()> {
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")?;
@@ -221,11 +352,30 @@ fn configure_connection(connection: &Connection) -> Result<()> {
 
 fn finalize_completed_weeks(transaction: &Transaction<'_>, today: NaiveDate) -> Result<()> {
     let cutoff = current_week(today).to_string();
+    // Keep any week that can still receive time from the active timer unrounded.
+    let active = transaction
+        .query_row(
+            "SELECT topic_id, date FROM daily_entries WHERE minutes IS NULL AND ended_at IS NULL",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let (protected_topic, protected_since) = match active {
+        Some((topic, date)) => (
+            Some(topic),
+            Some(week_start(parse_date(&date)?).to_string()),
+        ),
+        None => (None, None),
+    };
+    let archive_filter = "WHERE date < ?1 AND (minutes IS NOT NULL OR ended_at IS NOT NULL)
+                          AND (topic_id IS NOT ?2 OR date < ?3)";
+    let entries = params![cutoff, protected_topic, protected_since];
     let stale_entries = {
-        let mut statement = transaction.prepare(
-            "SELECT date, topic_id, minutes FROM daily_entries WHERE date < ?1 ORDER BY date, topic_id",
-        )?;
-        let rows = statement.query_map([&cutoff], |row| {
+        let mut statement = transaction.prepare(&format!(
+            "SELECT date, topic_id, COALESCE(minutes * 60000, ended_at - started_at)
+             FROM daily_entries {archive_filter}"
+        ))?;
+        let rows = statement.query_map(entries, |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
@@ -235,37 +385,31 @@ fn finalize_completed_weeks(transaction: &Transaction<'_>, today: NaiveDate) -> 
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    let mut totals = BTreeMap::<(i32, u32, i64), u64>::new();
-    for (date, topic_id, minutes) in stale_entries {
-        let date = parse_date(&date)?;
-        let minutes = u64::try_from(minutes).context("Invalid daily minute total")?;
-        let (iso_year, iso_week) = iso_week_key(date);
+    let mut totals = BTreeMap::<(i32, u32, i64), i64>::new();
+    for (date, topic_id, duration_ms) in stale_entries {
+        let (iso_year, iso_week) = iso_week_key(parse_date(&date)?);
         let total = totals.entry((iso_year, iso_week, topic_id)).or_default();
         *total = total
-            .checked_add(minutes)
-            .context("Weekly minute total is out of range")?;
+            .checked_add(duration_ms)
+            .context("Weekly study duration is out of range")?;
     }
 
-    for ((iso_year, iso_week, topic_id), minutes) in totals {
-        let minutes = i64::try_from(minutes).context("Weekly minute total is out of range")?;
-        add_weekly_minutes(transaction, (iso_year, iso_week), topic_id, minutes)?;
+    for ((year, week, topic_id), duration_ms) in totals {
+        let minutes = duration_ms / MILLIS_PER_MINUTE
+            + i64::from(duration_ms % MILLIS_PER_MINUTE >= MILLIS_PER_MINUTE / 2);
+        if minutes > 0 {
+            transaction.execute(
+                "INSERT INTO weekly_totals(iso_year, iso_week, topic_id, minutes)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(iso_year, iso_week, topic_id)
+                 DO UPDATE SET minutes = weekly_totals.minutes + excluded.minutes",
+                params![year, week, topic_id, minutes],
+            )?;
+        }
     }
-    transaction.execute("DELETE FROM daily_entries WHERE date < ?1", [&cutoff])?;
-    Ok(())
-}
-
-fn add_weekly_minutes(
-    transaction: &Transaction<'_>,
-    (iso_year, iso_week): (i32, u32),
-    topic_id: i64,
-    minutes: i64,
-) -> Result<()> {
     transaction.execute(
-        "INSERT INTO weekly_totals(iso_year, iso_week, topic_id, minutes)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(iso_year, iso_week, topic_id)
-         DO UPDATE SET minutes = weekly_totals.minutes + excluded.minutes",
-        params![iso_year, iso_week, topic_id, minutes],
+        &format!("DELETE FROM daily_entries {archive_filter}"),
+        entries,
     )?;
     Ok(())
 }
@@ -288,7 +432,7 @@ fn parse_minutes(minutes: i64) -> Result<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chrono::Duration as DateDuration;
     use std::{
@@ -298,7 +442,7 @@ mod tests {
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
-    pub(super) fn temporary_directory() -> PathBuf {
+    pub(crate) fn temporary_directory() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "kronos-sqlite-test-{}-{}-{}",
             std::process::id(),
@@ -313,6 +457,186 @@ mod tests {
         let directory = temporary_directory();
         let store = Store::create_new(&directory.join("kronos.sqlite3")).unwrap();
         (store, directory)
+    }
+
+    #[test]
+    fn timer_survives_reopening_and_credits_both_weeks_once() {
+        let (mut store, directory) = temporary_store();
+        store.add_topic("rust").unwrap();
+        store.add_topic("systems").unwrap();
+        let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let boundary = local_week_boundary(monday).unwrap().with_timezone(&Utc);
+        let start = boundary - DateDuration::hours(1);
+        let end = boundary + DateDuration::hours(1);
+        store.start_timer("rust", start).unwrap();
+        drop(store);
+
+        let database = directory.join("kronos.sqlite3");
+        let mut store = Store::open_existing(&database).unwrap();
+        let other = Store::open_existing(&database).unwrap();
+        let timer = store.active_timer().unwrap().unwrap();
+        assert_eq!(timer.topic, "rust");
+        assert_eq!(timer.elapsed_seconds(end), 7200);
+        assert!(other.start_timer("systems", start).is_err());
+
+        assert_eq!(store.stop_timer(timer.id, end).unwrap(), Some(7_200_000));
+        other.start_timer("systems", end).unwrap();
+        assert_eq!(store.stop_timer(timer.id, end).unwrap(), None);
+        assert_eq!(store.active_timer().unwrap().unwrap().topic, "systems");
+        let entries = store.load_current().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].date, end.with_timezone(&Local).date_naive());
+        assert_eq!(entries[0].duration_ms, 3_600_000);
+        let history = store.load_history().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!((history[0].iso_year, history[0].iso_week), (2026, 46));
+        assert_eq!(history[0].minutes, 60);
+
+        drop(other);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn timer_keeps_exact_durations_until_weekly_rollover() {
+        let (mut store, directory) = temporary_store();
+        let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let start = local_week_boundary(monday).unwrap().with_timezone(&Utc);
+        for (topic, durations) in [
+            ("short", vec![27_000, 2_999]),
+            ("half", vec![15_000, 15_000]),
+            ("manual and timer", vec![27_000, 4_000]),
+        ] {
+            store.add_topic(topic).unwrap();
+            for milliseconds in durations {
+                store.start_timer(topic, start).unwrap();
+                let id = store.active_timer().unwrap().unwrap().id;
+                let end = start + DateDuration::milliseconds(milliseconds);
+                assert_eq!(store.stop_timer(id, end).unwrap(), Some(milliseconds));
+            }
+        }
+        store
+            .connection
+            .execute(
+                "INSERT INTO daily_entries(date, topic_id, minutes)
+             SELECT ?1, id, 1 FROM topics WHERE name = 'manual and timer'",
+                [monday.to_string()],
+            )
+            .unwrap();
+
+        let totals = crate::model::aggregate_current(&store.load_current().unwrap());
+        assert_eq!(totals["short"], 29_999);
+        assert_eq!(totals["half"], 30_000);
+        assert_eq!(totals["manual and timer"], 91_000);
+
+        store
+            .rollover_if_needed(monday + DateDuration::weeks(1))
+            .unwrap();
+        assert!(store.load_current().unwrap().is_empty());
+        let totals = crate::model::aggregate_history(&store.load_history().unwrap());
+        assert!(!totals.contains_key("short"));
+        assert_eq!(totals["half"], 1);
+        assert_eq!(totals["manual and timer"], 2);
+
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rollover_waits_for_the_active_timer_before_archiving_its_topic() {
+        let (mut store, directory) = temporary_store();
+        store.add_topic("rust").unwrap();
+        let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let boundary = local_week_boundary(monday).unwrap().with_timezone(&Utc);
+        let first_start = boundary - DateDuration::hours(1);
+        store.start_timer("rust", first_start).unwrap();
+        let id = store.active_timer().unwrap().unwrap().id;
+        store
+            .stop_timer(id, first_start + DateDuration::seconds(20))
+            .unwrap();
+
+        let start = boundary - DateDuration::seconds(20);
+        store.start_timer("rust", start).unwrap();
+        let id = store.active_timer().unwrap().unwrap().id;
+        store.rollover_if_needed(monday).unwrap();
+        assert_eq!(store.active_timer().unwrap().unwrap().id, id);
+        assert!(store.load_history().unwrap().is_empty());
+        assert_eq!(store.load_current().unwrap()[0].duration_ms, 20_000);
+
+        store
+            .stop_timer(id, boundary + DateDuration::seconds(20))
+            .unwrap();
+        assert_eq!(store.load_history().unwrap()[0].minutes, 1);
+        assert_eq!(store.load_current().unwrap()[0].duration_ms, 20_000);
+
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn discarding_a_timer_deletes_only_the_matching_open_session() {
+        let (mut store, directory) = temporary_store();
+        store.add_topic("rust").unwrap();
+        let start = Utc::now();
+        store.start_timer("rust", start).unwrap();
+        let completed = store.active_timer().unwrap().unwrap().id;
+        store.stop_timer(completed, start).unwrap();
+
+        store.start_timer("rust", start).unwrap();
+        let discarded = store.active_timer().unwrap().unwrap().id;
+        store.discard_timer(discarded).unwrap();
+        store.start_timer("rust", start).unwrap();
+        let replacement = store.active_timer().unwrap().unwrap().id;
+        store.discard_timer(discarded).unwrap();
+        store.discard_timer(completed).unwrap();
+
+        assert_eq!(store.active_timer().unwrap().unwrap().id, replacement);
+        let count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM daily_entries WHERE id IN (?1, ?2)",
+                params![discarded, completed],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn unsuccessful_timer_credit_leaves_the_timer_running() {
+        let (mut store, directory) = temporary_store();
+        store.add_topic("rust").unwrap();
+        let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let start = local_week_boundary(monday).unwrap().with_timezone(&Utc);
+        let start = start - DateDuration::seconds(40);
+        store.start_timer("rust", start).unwrap();
+        let timer = store.active_timer().unwrap().unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_timer_credit BEFORE INSERT ON weekly_totals
+             BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .stop_timer(timer.id, start + DateDuration::minutes(1))
+                .is_err()
+        );
+        assert_eq!(store.active_timer().unwrap().unwrap().id, timer.id);
+        assert!(store.load_current().unwrap().is_empty());
+
+        let end = start + DateDuration::seconds(27);
+        assert_eq!(store.stop_timer(timer.id, end).unwrap(), Some(27_000));
+        assert!(store.active_timer().unwrap().is_none());
+        assert_eq!(store.load_current().unwrap()[0].duration_ms, 27_000);
+
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

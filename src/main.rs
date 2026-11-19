@@ -4,10 +4,10 @@ mod setup;
 mod storage;
 
 use anyhow::{Context, Result, bail};
-use chrono::{Local, Months, NaiveDate};
+use chrono::{Local, Months, NaiveDate, Utc};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -28,12 +28,14 @@ use std::{
     path::PathBuf,
     time::Duration as StdDuration,
 };
-use storage::Store;
+use storage::{ActiveTimer, Store};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Screen {
     Dashboard,
+    ResumeTimer,
     TopicSelect,
+    TimerTopicSelect,
     DateSelect,
     Duration,
     AddTopic,
@@ -42,6 +44,7 @@ enum Screen {
 
 struct App {
     store: Store,
+    active_timer: Option<ActiveTimer>,
     topics: Vec<String>,
     studied_topic_count: usize,
     current: Vec<CurrentEntry>,
@@ -67,6 +70,7 @@ impl App {
         let today = Local::now().date_naive();
         let mut app = Self {
             store,
+            active_timer: None,
             topics: Vec::new(),
             studied_topic_count: 0,
             current: Vec::new(),
@@ -87,16 +91,25 @@ impl App {
             quit: false,
         };
         app.reload()?;
+        if app.active_timer.is_some() {
+            app.screen = Screen::ResumeTimer;
+        }
         Ok(app)
     }
 
     fn reload(&mut self) -> Result<()> {
         let today = Local::now().date_naive();
         self.store.rollover_if_needed(today)?;
+        self.active_timer = self.store.active_timer()?;
         self.topics = self.store.topics()?;
         self.current = self.store.load_current()?;
+        let monday = week_start(today);
+        self.current.retain(|entry| entry.date >= monday);
         let totals = aggregate_current(&self.current);
-        self.studied_topic_count = totals.values().filter(|&&minutes| minutes > 0).count();
+        self.studied_topic_count = totals
+            .values()
+            .filter(|&&duration_ms| duration_ms > 0)
+            .count();
         // Stable sorting keeps the store's alphabetical order for equal totals.
         self.topics
             .sort_by_key(|topic| Reverse(totals.get(topic).copied().unwrap_or(0)));
@@ -121,8 +134,45 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         self.message.clear();
         match self.screen {
+            Screen::ResumeTimer => match key.code {
+                KeyCode::Char('y' | 'Y' | 'n' | 'N') if key.kind == KeyEventKind::Press => {
+                    let pending_id = self.active_timer.as_ref().map(|timer| timer.id);
+                    let discard = matches!(key.code, KeyCode::Char('n' | 'N'));
+                    if discard && let Some(id) = pending_id {
+                        self.store.discard_timer(id)?;
+                    }
+                    self.reload()?;
+                    if self.active_timer.is_none()
+                        || (!discard
+                            && self.active_timer.as_ref().map(|timer| timer.id) == pending_id)
+                    {
+                        self.screen = Screen::Dashboard;
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
+                _ => {}
+            },
             Screen::Dashboard => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+                KeyCode::Char('m') if key.kind == KeyEventKind::Press => {
+                    if let Some(timer) = &self.active_timer {
+                        let result = self.store.stop_timer(timer.id, Utc::now())?;
+                        self.reload()?;
+                        self.message = match result {
+                            Some(duration_ms) => {
+                                format!("Timer saved · {}", format_duration(duration_ms as u64))
+                            }
+                            None => "This timer was already stopped".into(),
+                        };
+                    } else {
+                        self.reload()?;
+                        if self.active_timer.is_none() {
+                            self.topic_filter.clear();
+                            self.selected = 0;
+                            self.screen = Screen::TimerTopicSelect;
+                        }
+                    }
+                }
                 KeyCode::Char('a') => {
                     self.reload()?;
                     self.topic_filter.clear();
@@ -141,10 +191,24 @@ impl App {
                 KeyCode::Up => self.move_selection(-1, self.studied_topic_count),
                 _ => {}
             },
-            Screen::TopicSelect => match key.code {
+            Screen::TopicSelect | Screen::TimerTopicSelect => match key.code {
                 KeyCode::Esc => self.screen = Screen::Dashboard,
                 KeyCode::Up => self.move_selection(-1, self.filtered_topics().count()),
                 KeyCode::Down => self.move_selection(1, self.filtered_topics().count()),
+                KeyCode::Enter
+                    if self.screen == Screen::TimerTopicSelect
+                        && self.filtered_topics().next().is_some() =>
+                {
+                    let topic = self
+                        .filtered_topics()
+                        .nth(self.selected)
+                        .context("No topic selected")?
+                        .to_owned();
+                    let result = self.store.start_timer(&topic, Utc::now());
+                    self.screen = Screen::Dashboard;
+                    self.reload()?;
+                    result?;
+                }
                 KeyCode::Enter if self.filtered_topics().next().is_some() => {
                     self.study_date = Local::now().date_naive();
                     self.date_field = 0;
@@ -377,18 +441,44 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         ])
         .split(frame.area());
 
-    let title = Paragraph::new(concat!(" kronos v", env!("CARGO_PKG_VERSION"), " "))
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+    let running = app.active_timer.is_some() && app.screen != Screen::ResumeTimer;
+    let title = match &app.active_timer {
+        Some(timer) if running => {
+            let seconds = timer.elapsed_seconds(Utc::now());
+            format!(
+                " ● Timer running {:02}:{:02}:{:02} · {} ",
+                seconds / 3600,
+                seconds / 60 % 60,
+                seconds % 60,
+                timer.topic
+            )
+        }
+        _ => concat!(" kronos v", env!("CARGO_PKG_VERSION"), " ").into(),
+    };
+    let title_style = if running {
+        Style::default().fg(Color::Black).bg(Color::LightRed)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let title = Paragraph::new(title)
+        .style(title_style.add_modifier(Modifier::BOLD))
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(title, areas[0]);
 
     match app.screen {
         Screen::Dashboard => draw_dashboard(frame, app, areas[1]),
-        Screen::TopicSelect => draw_topic_select(frame, app, areas[1]),
+        Screen::ResumeTimer => {
+            if let Some(timer) = &app.active_timer {
+                let prompt = Paragraph::new(format!(
+                    "Continue the running timer for \"{}\"?\nDiscarding deletes the session without adding study time.",
+                    timer.topic
+                ))
+                .wrap(Wrap { trim: true })
+                .block(Block::bordered().title("Resume study timer"));
+                frame.render_widget(prompt, areas[1]);
+            }
+        }
+        Screen::TopicSelect | Screen::TimerTopicSelect => draw_topic_select(frame, app, areas[1]),
         Screen::DateSelect => draw_date_select(frame, app, areas[1]),
         Screen::Duration => draw_duration(frame, app, areas[1]),
         Screen::AddTopic => draw_input(
@@ -407,24 +497,33 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     frame.render_widget(footer, areas[2]);
 }
 
+fn format_duration(duration_ms: u64) -> String {
+    let seconds = duration_ms / 1000;
+    let fractional = duration_ms % 1000;
+    let clock = format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    );
+    if fractional == 0 {
+        clock
+    } else {
+        format!("{clock}.{fractional:03}")
+    }
+}
+
 fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
     let today = Local::now().date_naive();
     let start = week_start(today);
     let (iso_year, iso_week) = iso_week_key(today);
     let totals = aggregate_current(&app.current);
-    let total: u32 = totals.values().sum();
+    let total: u64 = totals.values().sum();
     let rows = app
         .topics
         .iter()
         .take(app.studied_topic_count)
-        .map(|topic| {
-            let minutes = totals[topic];
-            ListItem::new(format!(
-                "  {topic:<20} {:>3}h {:02}m",
-                minutes / 60,
-                minutes % 60
-            ))
-        })
+        .map(|topic| ListItem::new(format!("  {topic:<20} {}", format_duration(totals[topic]))))
         .collect::<Vec<_>>();
     let rows = if rows.is_empty() {
         vec![ListItem::new("  No study time recorded this week.")]
@@ -433,9 +532,8 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layo
     };
     let list = List::new(rows)
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " ISO week {iso_year}-W{iso_week:02} · Monday {start} · Total {}h {:02}m ",
-            total / 60,
-            total % 60
+            " ISO week {iso_year}-W{iso_week:02} · Monday {start} · Total {} ",
+            format_duration(total)
         )))
         .highlight_style(
             Style::default()
@@ -470,6 +568,11 @@ fn draw_topic_select(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::l
         search,
     );
 
+    let title = if app.screen == Screen::TimerTopicSelect {
+        "Select a topic to start the timer"
+    } else {
+        "Select a topic"
+    };
     let topics: Vec<_> = app.filtered_topics().collect();
     if topics.is_empty() {
         let message = if app.topics.is_empty() {
@@ -478,15 +581,11 @@ fn draw_topic_select(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::l
             "No matching topics."
         };
         frame.render_widget(
-            Paragraph::new(message).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Select a topic"),
-            ),
+            Paragraph::new(message).block(Block::default().borders(Borders::ALL).title(title)),
             results,
         );
     } else {
-        draw_list(frame, "Select a topic", &topics, app.selected, results);
+        draw_list(frame, title, &topics, app.selected, results);
     }
 }
 
@@ -644,14 +743,22 @@ fn help_text(app: &App) -> String {
         return format!(" Error: {} ", app.message);
     }
     match app.screen {
+        Screen::ResumeTimer => " y Continue   n Discard   Esc Quit ".into(),
         Screen::Dashboard => {
             if app.message.is_empty() {
-                " a Add study time   t Add topic   h History   q Quit ".to_owned()
+                let timer_action = if app.active_timer.is_some() {
+                    "Stop"
+                } else {
+                    "Start"
+                };
+                format!(" m {timer_action} timer   a Add time   t Add topic   h History   q Quit ")
             } else {
                 format!(" {} ", app.message)
             }
         }
-        Screen::TopicSelect => " Type to filter   ↑↓ Navigate   Enter Confirm   Esc Back ".into(),
+        Screen::TopicSelect | Screen::TimerTopicSelect => {
+            " Type to filter   ↑↓ Navigate   Enter Confirm   Esc Back ".into()
+        }
         Screen::DateSelect => " ←→ Day/Month/Year   ↑↓ Adjust   Enter Confirm   Esc Back ".into(),
         Screen::AddTopic => " Type   Backspace Delete   Enter Confirm   Esc Cancel ".into(),
         Screen::Duration => {
@@ -675,6 +782,59 @@ mod tests {
     use chrono::Duration;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn dashboard_can_start_and_stop_a_recovered_timer() -> Result<()> {
+        let directory = storage::tests::temporary_directory();
+        let database = directory.join("kronos.sqlite3");
+        let mut store = Store::create_new(&database)?;
+        store.add_topic("rust")?;
+        let mut app = App::new(store)?;
+        let timer_key = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+        app.handle_key(timer_key)?;
+        assert!(app.screen == Screen::TimerTopicSelect);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+        assert!(app.screen == Screen::Dashboard);
+        let id = app.active_timer.as_ref().unwrap().id;
+        drop(app);
+
+        let mut app = App::new(Store::open_existing(&database)?)?;
+        assert_eq!(app.active_timer.as_ref().unwrap().id, id);
+        assert!(app.screen == Screen::ResumeTimer);
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))?;
+        assert!(app.screen == Screen::Dashboard);
+        assert_eq!(app.active_timer.as_ref().unwrap().id, id);
+        let mut terminal = Terminal::new(TestBackend::new(80, 16))?;
+        terminal.draw(|frame| draw(frame, &app))?;
+        let title = terminal.backend().buffer().content()[80..160]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(title.contains("Timer running") && title.contains("rust"));
+        assert_eq!(
+            terminal.backend().buffer().content()[82].bg,
+            Color::LightRed
+        );
+
+        app.handle_key(timer_key)?;
+        assert!(app.active_timer.is_none());
+        assert!(app.store.active_timer()?.is_none());
+
+        app.store
+            .start_timer("rust", Utc::now() - Duration::minutes(10))?;
+        let before_discard = app.store.load_current()?;
+        drop(app);
+        let mut app = App::new(Store::open_existing(&database)?)?;
+        assert!(app.screen == Screen::ResumeTimer);
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))?;
+        assert!(app.screen == Screen::Dashboard);
+        assert!(app.store.active_timer()?.is_none());
+        assert_eq!(app.store.load_current()?, before_discard);
+
+        drop(app);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
 
     #[test]
     fn study_menu_and_history_rank_topics_by_weekly_duration() -> Result<()> {
@@ -759,7 +919,7 @@ mod tests {
         ] {
             press(&mut app, key)?;
         }
-        assert_eq!(aggregate_current(&app.current)["chemistry"], 120);
+        assert_eq!(aggregate_current(&app.current)["chemistry"], 120 * 60_000);
 
         press(&mut app, KeyCode::Char('a'))?;
         for key in [KeyCode::Char('I'), KeyCode::Char('x'), KeyCode::Enter] {
@@ -784,7 +944,7 @@ mod tests {
         ] {
             press(&mut app, key)?;
         }
-        assert_eq!(aggregate_current(&app.current)["biology"], 80);
+        assert_eq!(aggregate_current(&app.current)["biology"], 80 * 60_000);
 
         press(&mut app, KeyCode::Char('h'))?;
         terminal.draw(|frame| draw(frame, &app))?;
