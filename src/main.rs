@@ -12,7 +12,8 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use model::{
-    CurrentEntry, HistoryEntry, aggregate_current, aggregate_history, iso_week_key, week_start,
+    CurrentEntry, GoalProgress, HistoryEntry, WeeklyGoal, aggregate_current, aggregate_history,
+    iso_week_key, week_start,
 };
 use ratatui::{
     Terminal,
@@ -40,6 +41,8 @@ enum Screen {
     Duration,
     AddTopic,
     History,
+    GoalProgress,
+    EditGoal,
 }
 
 struct App {
@@ -61,6 +64,8 @@ struct App {
     step: u32,
     history_weeks: Vec<(i32, u32)>,
     history_index: usize,
+    goal_progress: GoalProgress,
+    goal_input: String,
     message: String,
     quit: bool,
 }
@@ -87,6 +92,8 @@ impl App {
             step: 1,
             history_weeks: Vec::new(),
             history_index: 0,
+            goal_progress: GoalProgress::NoGoal,
+            goal_input: String::new(),
             message: String::new(),
             quit: false,
         };
@@ -183,6 +190,7 @@ impl App {
                     self.topic_input.clear();
                     self.screen = Screen::AddTopic;
                 }
+                KeyCode::Char('g') => self.open_goal_progress()?,
                 KeyCode::Char('h') => {
                     self.history_index = 0;
                     self.screen = Screen::History;
@@ -274,6 +282,37 @@ impl App {
                 KeyCode::Char(ch) if !ch.is_control() => self.topic_input.push(ch),
                 _ => {}
             },
+            Screen::GoalProgress => match key.code {
+                KeyCode::Esc | KeyCode::Char('g') => self.screen = Screen::Dashboard,
+                KeyCode::Char('e') => {
+                    self.goal_input.clear();
+                    self.screen = Screen::EditGoal;
+                }
+                _ => {}
+            },
+            Screen::EditGoal => match key.code {
+                KeyCode::Esc => self.screen = Screen::GoalProgress,
+                KeyCode::Backspace => {
+                    self.goal_input.pop();
+                }
+                KeyCode::Enter => {
+                    let fields: Vec<_> = self.goal_input.split_whitespace().collect();
+                    let [date, minutes] = fields.as_slice() else {
+                        bail!("Enter a Monday date and weekly minutes");
+                    };
+                    let starts_on = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                        .context("Enter the start date as YYYY-MM-DD")?;
+                    let minutes_per_week =
+                        minutes.parse().context("Enter whole minutes per week")?;
+                    self.store.save_weekly_goal(WeeklyGoal {
+                        starts_on,
+                        minutes_per_week,
+                    })?;
+                    self.open_goal_progress()?;
+                }
+                KeyCode::Char(ch) if !ch.is_control() => self.goal_input.push(ch),
+                _ => {}
+            },
             Screen::History => match key.code {
                 KeyCode::Esc | KeyCode::Char('h') => self.screen = Screen::Dashboard,
                 KeyCode::Left => self.move_history(1),
@@ -281,6 +320,12 @@ impl App {
                 _ => {}
             },
         }
+        Ok(())
+    }
+
+    fn open_goal_progress(&mut self) -> Result<()> {
+        self.goal_progress = self.store.goal_progress(Local::now().date_naive())?;
+        self.screen = Screen::GoalProgress;
         Ok(())
     }
 
@@ -488,6 +533,19 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
             areas[1],
         ),
         Screen::History => draw_history(frame, app, areas[1]),
+        Screen::GoalProgress => draw_goal_progress(frame, &app.goal_progress, areas[1]),
+        Screen::EditGoal => {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from("Enter a Monday (YYYY-MM-DD) and minutes per week."),
+                    Line::from("Example: 2026-11-16 420"),
+                    Line::from(format!("{}_", app.goal_input)),
+                ])
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title("Set weekly goal")),
+                areas[1],
+            );
+        }
     }
 
     let help = help_text(app);
@@ -511,6 +569,68 @@ fn format_duration(duration_ms: u64) -> String {
     } else {
         format!("{clock}.{fractional:03}")
     }
+}
+
+fn draw_goal_progress(
+    frame: &mut ratatui::Frame<'_>,
+    progress: &GoalProgress,
+    area: ratatui::layout::Rect,
+) {
+    let lines = match progress {
+        GoalProgress::NoGoal => vec![Line::from("No weekly goal. Press e to set one.")],
+        GoalProgress::Scheduled(goal) => vec![Line::from(format!(
+            "Plan starts on {} · {} per week",
+            goal.starts_on,
+            format_duration(u64::from(goal.minutes_per_week) * 60_000)
+        ))],
+        GoalProgress::Started {
+            starts_on,
+            current_goal,
+            next_goal,
+            studied_ms,
+            expected_ms,
+        } => {
+            let difference = format_duration(studied_ms.abs_diff(*expected_ms));
+            let (status, color) = match studied_ms.cmp(expected_ms) {
+                std::cmp::Ordering::Greater => (format!("Ahead by {difference}"), Color::Green),
+                std::cmp::Ordering::Less => (format!("Behind by {difference}"), Color::LightRed),
+                std::cmp::Ordering::Equal => ("On track".into(), Color::Green),
+            };
+            let mut lines = vec![
+                Line::from(format!("Plan since {starts_on}")),
+                Line::from(format!(
+                    "Current weekly goal  {}",
+                    format_duration(u64::from(current_goal.minutes_per_week) * 60_000)
+                )),
+                Line::from(format!(
+                    "Total studied        {}",
+                    format_duration(*studied_ms)
+                )),
+                Line::from(format!(
+                    "Expected through today  {}",
+                    format_duration(*expected_ms)
+                )),
+                Line::styled(
+                    status,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if let Some(goal) = next_goal {
+                lines.push(Line::from(format!(
+                    "Next weekly goal     {} from {}",
+                    format_duration(u64::from(goal.minutes_per_week) * 60_000),
+                    goal.starts_on,
+                )));
+            }
+            lines
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::bordered().title("Goal progress")),
+        area,
+    );
 }
 
 fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
@@ -751,7 +871,9 @@ fn help_text(app: &App) -> String {
                 } else {
                     "Start"
                 };
-                format!(" m {timer_action} timer   a Add time   t Add topic   h History   q Quit ")
+                format!(
+                    " m {timer_action} timer   a Add time   t Add topic   h History   g Goals   q Quit "
+                )
             } else {
                 format!(" {} ", app.message)
             }
@@ -765,6 +887,8 @@ fn help_text(app: &App) -> String {
             " ←→ Field   ↑↓ Adjust   s Step 1/5/15m   Enter Save   Esc Back ".into()
         }
         Screen::History => " ←→ Previous/next week   Esc Back to dashboard ".into(),
+        Screen::GoalProgress => " e Set weekly goal   Esc Back ".into(),
+        Screen::EditGoal => " Enter Save   Esc Cancel ".into(),
     }
 }
 
@@ -782,6 +906,54 @@ mod tests {
     use chrono::Duration;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn weekly_goal_can_be_configured_from_progress_and_survives_reopening() -> Result<()> {
+        let directory = storage::tests::temporary_directory();
+        let database = directory.join("kronos.sqlite3");
+        let monday = week_start(Local::now().date_naive());
+        let mut app = App::new(Store::create_new(&database)?)?;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.handle_key(key(KeyCode::Char('g')))?;
+        assert!(matches!(app.goal_progress, GoalProgress::NoGoal));
+        app.handle_key(key(KeyCode::Char('e')))?;
+        app.goal_input = format!("{} 420", monday + Duration::days(1));
+        assert!(app.handle_key(key(KeyCode::Enter)).is_err());
+        assert!(app.screen == Screen::EditGoal);
+        app.goal_input = format!("{monday} 420");
+        app.handle_key(key(KeyCode::Enter))?;
+        assert!(app.screen == Screen::GoalProgress);
+        let mut terminal = Terminal::new(TestBackend::new(80, 16))?;
+        terminal.draw(|frame| draw(frame, &app))?;
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Total studied"));
+        assert!(rendered.contains("Expected through today"));
+        assert!(rendered.contains("Behind by"));
+        drop(app);
+
+        let mut app = App::new(Store::open_existing(&database)?)?;
+        app.handle_key(key(KeyCode::Char('g')))?;
+        assert!(matches!(
+            app.goal_progress,
+            GoalProgress::Started {
+                studied_ms: 0,
+                current_goal: WeeklyGoal {
+                    minutes_per_week: 420,
+                    ..
+                },
+                ..
+            }
+        ));
+        drop(app);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
 
     #[test]
     fn dashboard_can_start_and_stop_a_recovered_timer() -> Result<()> {
