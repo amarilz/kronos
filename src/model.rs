@@ -22,6 +22,12 @@ pub struct WeeklyGoal {
     pub minutes_per_week: u32,
 }
 
+impl WeeklyGoal {
+    pub fn expected_ms_for_days(self, days: u64) -> u64 {
+        u64::from(self.minutes_per_week) * 60_000 * days / 7
+    }
+}
+
 pub enum GoalProgress {
     NoGoal,
     Scheduled(WeeklyGoal),
@@ -49,7 +55,7 @@ pub fn summarize_goals(
 
     const MS_PER_MINUTE: u64 = 60_000;
     let mut current_goal = *first_goal;
-    let mut expected_weekly_ms_days = 0;
+    let mut expected_ms = 0;
     for (index, goal) in goals
         .iter()
         .enumerate()
@@ -59,7 +65,7 @@ pub fn summarize_goals(
             Some(next) => (next.starts_on - goal.starts_on).num_days(),
             None => (today - goal.starts_on).num_days() + 1,
         };
-        expected_weekly_ms_days += days as u64 * u64::from(goal.minutes_per_week) * MS_PER_MINUTE;
+        expected_ms += goal.expected_ms_for_days(days as u64);
         current_goal = *goal;
     }
 
@@ -81,7 +87,7 @@ pub fn summarize_goals(
         current_goal,
         next_goal: goals.iter().find(|goal| goal.starts_on > today).copied(),
         studied_ms: archived_ms + daily_ms,
-        expected_ms: expected_weekly_ms_days / 7,
+        expected_ms,
     }
 }
 

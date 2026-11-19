@@ -1,7 +1,7 @@
 mod config;
 mod model;
-mod setup;
 mod storage;
+mod ui;
 
 use anyhow::{Context, Result, bail};
 use chrono::{Local, Months, NaiveDate, Utc};
@@ -11,18 +11,8 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use model::{
-    CurrentEntry, GoalProgress, HistoryEntry, WeeklyGoal, aggregate_current, aggregate_history,
-    iso_week_key, week_start,
-};
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
-};
+use model::{CurrentEntry, GoalProgress, HistoryEntry, aggregate_current, week_start};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     cmp::Reverse,
     io::{self, Stdout},
@@ -171,7 +161,7 @@ impl App {
                         self.reload()?;
                         self.message = match result {
                             Some(duration_ms) => {
-                                format!("Timer saved · {}", format_duration(duration_ms as u64))
+                                format!("Timer saved · {}", ui::format_duration(duration_ms as u64))
                             }
                             None => "This timer was already stopped".into(),
                         };
@@ -300,18 +290,8 @@ impl App {
                     self.goal_input.pop();
                 }
                 KeyCode::Enter => {
-                    let fields: Vec<_> = self.goal_input.split_whitespace().collect();
-                    let [date, minutes] = fields.as_slice() else {
-                        bail!("Enter a Monday date and weekly minutes");
-                    };
-                    let starts_on = NaiveDate::parse_from_str(date, "%Y-%m-%d")
-                        .context("Enter the start date as YYYY-MM-DD")?;
-                    let minutes_per_week =
-                        minutes.parse().context("Enter whole minutes per week")?;
-                    self.store.save_weekly_goal(WeeklyGoal {
-                        starts_on,
-                        minutes_per_week,
-                    })?;
+                    self.store
+                        .save_weekly_goal(ui::goals::parse_goal(&self.goal_input)?)?;
                     self.open_goal_progress()?;
                 }
                 KeyCode::Char(ch) if !ch.is_control() => self.goal_input.push(ch),
@@ -422,7 +402,7 @@ fn main() -> Result<()> {
 
 fn resolve_store(database: Option<PathBuf>, configure_db: bool) -> Result<Store> {
     if configure_db {
-        return setup::run(&Store::default_database_path()?, None);
+        return ui::setup::run(&Store::default_database_path()?, None);
     }
 
     if let Some(path) = database {
@@ -436,12 +416,12 @@ fn resolve_store(database: Option<PathBuf>, configure_db: bool) -> Result<Store>
     match config::load_database_path()? {
         Some(path) => match Store::open_existing(&path) {
             Ok(store) => Ok(store),
-            Err(error) => setup::run(
+            Err(error) => ui::setup::run(
                 &path,
                 Some(format!("The saved database could not be opened: {error}")),
             ),
         },
-        None => setup::run(&Store::default_database_path()?, None),
+        None => ui::setup::run(&Store::default_database_path()?, None),
     }
 }
 
@@ -474,7 +454,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         {
             app.reload()?;
         }
-        terminal.draw(|frame| draw(frame, app))?;
+        terminal.draw(|frame| ui::draw(frame, app))?;
         if event::poll(StdDuration::from_millis(200))?
             && let Event::Key(key) = event::read()?
             && let Err(error) = app.handle_key(key)
@@ -483,475 +463,6 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         }
     }
     Ok(())
-}
-
-fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(3),
-        ])
-        .split(frame.area());
-
-    let running = app.active_timer.is_some() && app.screen != Screen::ResumeTimer;
-    let title = match &app.active_timer {
-        Some(timer) if running => {
-            let seconds = timer.elapsed_seconds(Utc::now());
-            format!(
-                " ● Timer running {:02}:{:02}:{:02} · {} ",
-                seconds / 3600,
-                seconds / 60 % 60,
-                seconds % 60,
-                timer.topic
-            )
-        }
-        _ => concat!(" kronos v", env!("CARGO_PKG_VERSION"), " ").into(),
-    };
-    let title_style = if running {
-        Style::default().fg(Color::Black).bg(Color::LightRed)
-    } else {
-        Style::default().fg(Color::Cyan)
-    };
-    let title = Paragraph::new(title)
-        .style(title_style.add_modifier(Modifier::BOLD))
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(title, areas[0]);
-
-    match app.screen {
-        Screen::Dashboard => draw_dashboard(frame, app, areas[1]),
-        Screen::ResumeTimer => {
-            if let Some(timer) = &app.active_timer {
-                let prompt = Paragraph::new(format!(
-                    "Continue the running timer for \"{}\"?\nDiscarding deletes the session without adding study time.",
-                    timer.topic
-                ))
-                .wrap(Wrap { trim: true })
-                .block(Block::bordered().title("Resume study timer"));
-                frame.render_widget(prompt, areas[1]);
-            }
-        }
-        Screen::TopicSelect | Screen::TimerTopicSelect => draw_topic_select(frame, app, areas[1]),
-        Screen::DateSelect => draw_date_select(frame, app, areas[1]),
-        Screen::Duration => draw_duration(frame, app, areas[1]),
-        Screen::AddTopic => draw_input(
-            frame,
-            "New topic · Enter to save",
-            &app.topic_input,
-            areas[1],
-        ),
-        Screen::History => draw_history(frame, app, areas[1]),
-        Screen::GoalProgress => draw_goal_progress(frame, &app.goal_progress, areas[1]),
-        Screen::EditGoal => {
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from("Enter a Monday (YYYY-MM-DD) and minutes per week."),
-                    Line::from("Example: 2026-11-16 420"),
-                    Line::from(format!("{}_", app.goal_input)),
-                ])
-                .wrap(Wrap { trim: false })
-                .block(Block::bordered().title("Set weekly goal")),
-                areas[1],
-            );
-        }
-    }
-
-    let help = help_text(app);
-    let footer = Paragraph::new(help)
-        .style(Style::default().fg(Color::Gray))
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(footer, areas[2]);
-}
-
-fn format_duration(duration_ms: u64) -> String {
-    let seconds = duration_ms / 1000;
-    let fractional = duration_ms % 1000;
-    let clock = format!(
-        "{:02}:{:02}:{:02}",
-        seconds / 3600,
-        seconds / 60 % 60,
-        seconds % 60
-    );
-    if fractional == 0 {
-        clock
-    } else {
-        format!("{clock}.{fractional:03}")
-    }
-}
-
-fn format_goal_duration(duration_ms: u64, show_days: bool) -> String {
-    let total_minutes = duration_ms / 60_000;
-    if total_minutes == 0 && duration_ms > 0 {
-        return "<1m".into();
-    }
-    let hours = total_minutes / 60;
-    let minutes = total_minutes % 60;
-    if show_days && hours >= 24 {
-        format!("{}d {}h {minutes:02}m", hours / 24, hours % 24)
-    } else {
-        format!("{hours}h {minutes:02}m")
-    }
-}
-
-fn goal_balance(studied_ms: u64, expected_ms: u64) -> (&'static str, Color) {
-    match studied_ms.cmp(&expected_ms) {
-        std::cmp::Ordering::Greater => ("Ahead by", Color::Green),
-        std::cmp::Ordering::Less => ("Behind by", Color::LightRed),
-        std::cmp::Ordering::Equal => ("On track", Color::Green),
-    }
-}
-
-fn draw_goal_progress(
-    frame: &mut ratatui::Frame<'_>,
-    progress: &GoalProgress,
-    area: ratatui::layout::Rect,
-) {
-    let lines = match progress {
-        GoalProgress::NoGoal => vec![Line::from("No weekly goal. Press e to set one.")],
-        GoalProgress::Scheduled(goal) => vec![Line::from(format!(
-            "Plan starts on {} · {} per week",
-            goal.starts_on,
-            format_goal_duration(u64::from(goal.minutes_per_week) * 60_000, false)
-        ))],
-        GoalProgress::Started {
-            starts_on,
-            current_goal,
-            next_goal,
-            studied_ms,
-            expected_ms,
-        } => {
-            let weekly_goal_ms = u64::from(current_goal.minutes_per_week) * 60_000;
-            let difference_ms = studied_ms.abs_diff(*expected_ms);
-            let mut difference = format_goal_duration(difference_ms, false);
-            if difference_ms >= weekly_goal_ms {
-                let equivalent_weeks = difference_ms as f64 / weekly_goal_ms as f64;
-                difference.push_str(&format!(" (~{equivalent_weeks:.1} weeks at current goal)"));
-            }
-            let (label, color) = goal_balance(*studied_ms, *expected_ms);
-            let status = if difference_ms == 0 {
-                label.to_owned()
-            } else {
-                format!("{label} {difference}")
-            };
-            let mut lines = vec![
-                Line::from(format!("Plan since {starts_on}")),
-                Line::from(format!(
-                    "{:<24} {}",
-                    "Current weekly goal",
-                    format_goal_duration(weekly_goal_ms, false)
-                )),
-                Line::from(format!(
-                    "{:<24} {}",
-                    "Total studied",
-                    format_goal_duration(*studied_ms, true)
-                )),
-                Line::from(format!(
-                    "{:<24} {}",
-                    "Expected through today",
-                    format_goal_duration(*expected_ms, true)
-                )),
-                Line::styled(
-                    status,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-            ];
-            if let Some(goal) = next_goal {
-                lines.push(Line::from(format!(
-                    "{:<24} {} from {}",
-                    "Next weekly goal",
-                    format_goal_duration(u64::from(goal.minutes_per_week) * 60_000, false),
-                    goal.starts_on,
-                )));
-            }
-            lines
-        }
-    };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::bordered().title("Goal progress · 1d = 24h")),
-        area,
-    );
-}
-
-fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
-    let today = app.snapshot_date;
-    let start = week_start(today);
-    let (iso_year, iso_week) = iso_week_key(today);
-    let totals = aggregate_current(&app.current);
-    let total: u64 = totals.values().sum();
-    let area = if let GoalProgress::Started { current_goal, .. } = app.goal_progress {
-        let days_elapsed = (today - start).num_days() as u64 + 1;
-        let expected_ms = u64::from(current_goal.minutes_per_week) * 60_000 * days_elapsed / 7;
-        let (label, color) = goal_balance(total, expected_ms);
-        let balance = if total == expected_ms {
-            format!("  This week · {label}")
-        } else {
-            let difference = format_goal_duration(total.abs_diff(expected_ms), false);
-            format!("  This week · {label} {difference}")
-        };
-        let [status, study_list] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-        frame.render_widget(
-            Paragraph::new(balance).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            status,
-        );
-        study_list
-    } else {
-        area
-    };
-    let rows = app
-        .topics
-        .iter()
-        .take(app.studied_topic_count)
-        .map(|topic| ListItem::new(format!("  {topic:<20} {}", format_duration(totals[topic]))))
-        .collect::<Vec<_>>();
-    let rows = if rows.is_empty() {
-        vec![ListItem::new("  No study time recorded this week.")]
-    } else {
-        rows
-    };
-    let list = List::new(rows)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " ISO week {iso_year}-W{iso_week:02} · Monday {start} · Total {} ",
-            format_duration(total)
-        )))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
-    let mut state = ListState::default();
-    if app.studied_topic_count > 0 {
-        state.select(Some(app.selected.min(app.studied_topic_count - 1)));
-    }
-    frame.render_stateful_widget(list, area, &mut state);
-    if !app.message.is_empty() {
-        let message_area = ratatui::layout::Rect {
-            x: area.x.saturating_add(2),
-            y: area.y.saturating_add(area.height.saturating_sub(2)),
-            width: area.width.saturating_sub(4),
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(app.message.as_str()).style(Style::default().fg(Color::Green)),
-            message_area,
-        );
-    }
-}
-
-fn draw_topic_select(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
-    let [search, results] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-    frame.render_widget(
-        Paragraph::new(format!(" Filter: {}_", app.topic_filter)),
-        search,
-    );
-
-    let title = if app.screen == Screen::TimerTopicSelect {
-        "Select a topic to start the timer"
-    } else {
-        "Select a topic"
-    };
-    let topics: Vec<_> = app.filtered_topics().collect();
-    if topics.is_empty() {
-        let message = if app.topics.is_empty() {
-            "No topics yet."
-        } else {
-            "No matching topics."
-        };
-        frame.render_widget(
-            Paragraph::new(message).block(Block::default().borders(Borders::ALL).title(title)),
-            results,
-        );
-    } else {
-        draw_list(frame, title, &topics, app.selected, results);
-    }
-}
-
-fn draw_list(
-    frame: &mut ratatui::Frame<'_>,
-    title: &str,
-    options: &[impl AsRef<str>],
-    selected: usize,
-    area: ratatui::layout::Rect,
-) {
-    let items = options
-        .iter()
-        .map(|option| ListItem::new(format!("  {}", option.as_ref())))
-        .collect::<Vec<_>>();
-    let mut state = ListState::default();
-    if !options.is_empty() {
-        state.select(Some(selected.min(options.len() - 1)));
-    }
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> "),
-        area,
-        &mut state,
-    );
-}
-
-fn draw_input(
-    frame: &mut ratatui::Frame<'_>,
-    title: &str,
-    value: &str,
-    area: ratatui::layout::Rect,
-) {
-    let input = Paragraph::new(format!("{value}_"))
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(input, area);
-}
-
-fn draw_date_select(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
-    let selected_style = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-    let date = app.study_date;
-    let fields = ["%d", "%m", "%Y"];
-    let mut values = Line::default();
-    for (index, format) in fields.into_iter().enumerate() {
-        if index > 0 {
-            values.push_span(" / ");
-        }
-        let style = if app.date_field == index {
-            selected_style
-        } else {
-            Style::default()
-        };
-        values.push_span(Span::styled(date.format(format).to_string(), style));
-    }
-    frame.render_widget(
-        Paragraph::new(vec![values, Line::from(date.format("%A").to_string())])
-            .centered()
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("When did you study?"),
-            ),
-        area,
-    );
-}
-
-fn draw_duration(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
-    let selected_style = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-    let hour_style = if app.duration_field == 0 {
-        selected_style
-    } else {
-        Style::default()
-    };
-    let minute_style = if app.duration_field == 1 {
-        selected_style
-    } else {
-        Style::default()
-    };
-    let content = vec![
-        Line::from(vec![Span::raw("             Hours     Minutes")]),
-        Line::from(vec![
-            Span::raw("             "),
-            Span::styled(format!("{:02}", app.hours), hour_style),
-            Span::raw("   :   "),
-            Span::styled(format!("{:02}", app.minutes), minute_style),
-        ]),
-        Line::from(format!(
-            "\n     Date: {} · Minute step: {}",
-            app.study_date, app.step
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(content).block(Block::default().borders(Borders::ALL).title("Duration")),
-        area,
-    );
-}
-
-fn draw_history(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
-    if app.history_weeks.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No history available.")
-                .block(Block::default().borders(Borders::ALL).title("History")),
-            area,
-        );
-        return;
-    }
-    let (iso_year, iso_week) = app.history_weeks[app.history_index];
-    let entries: Vec<HistoryEntry> = app
-        .history
-        .iter()
-        .filter(|entry| entry.iso_year == iso_year && entry.iso_week == iso_week)
-        .cloned()
-        .collect();
-    let totals = aggregate_history(&entries);
-    let total: u32 = totals.values().sum();
-    let mut ranked_topics: Vec<_> = totals.into_iter().collect();
-    ranked_topics.sort_by_key(|(_, minutes)| Reverse(*minutes));
-    let lines = ranked_topics
-        .into_iter()
-        .map(|(topic, minutes)| {
-            Line::from(format!(
-                "  {topic:<20} {:>3}h {:02}m",
-                minutes / 60,
-                minutes % 60
-            ))
-        })
-        .collect::<Vec<_>>();
-    let content = std::iter::once(Line::from(format!(
-        "ISO week {iso_year}-W{iso_week:02} · Total {}h {:02}m\n",
-        total / 60,
-        total % 60
-    )))
-    .chain(lines)
-    .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(content)
-            .block(Block::default().borders(Borders::ALL).title("History"))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn help_text(app: &App) -> String {
-    if !app.message.is_empty() && app.screen != Screen::Dashboard {
-        return format!(" Error: {} ", app.message);
-    }
-    match app.screen {
-        Screen::ResumeTimer => " y Continue   n Discard   Esc Quit ".into(),
-        Screen::Dashboard => {
-            if app.message.is_empty() {
-                let timer_action = if app.active_timer.is_some() {
-                    "Stop"
-                } else {
-                    "Start"
-                };
-                format!(
-                    " m {timer_action} timer   a Add time   t Add topic   h History   g Goals   q Quit "
-                )
-            } else {
-                format!(" {} ", app.message)
-            }
-        }
-        Screen::TopicSelect | Screen::TimerTopicSelect => {
-            " Type to filter   ↑↓ Navigate   Enter Confirm   Esc Back ".into()
-        }
-        Screen::DateSelect => " ←→ Day/Month/Year   ↑↓ Adjust   Enter Confirm   Esc Back ".into(),
-        Screen::AddTopic => " Type   Backspace Delete   Enter Confirm   Esc Cancel ".into(),
-        Screen::Duration => {
-            " ←→ Field   ↑↓ Adjust   s Step 1/5/15m   Enter Save   Esc Back ".into()
-        }
-        Screen::History => " ←→ Previous/next week   Esc Back to dashboard ".into(),
-        Screen::GoalProgress => " e Set weekly goal   Esc Back ".into(),
-        Screen::EditGoal => " Enter Save   Esc Cancel ".into(),
-    }
 }
 
 fn next_step(step: u32) -> u32 {
@@ -967,7 +478,8 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use crossterm::event::KeyModifiers;
-    use ratatui::backend::TestBackend;
+    use model::WeeklyGoal;
+    use ratatui::{backend::TestBackend, style::Color};
 
     #[test]
     fn dashboard_colors_the_weekly_balance_independently_of_the_plan_balance() -> Result<()> {
@@ -988,7 +500,7 @@ mod tests {
             matches!(app.goal_progress, GoalProgress::Started { studied_ms, expected_ms, .. }
             if studied_ms > expected_ms)
         );
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &app))?;
         let status = &terminal.backend().buffer().content()[240..320];
         let text: String = status.iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains("This week · Behind by"));
@@ -996,7 +508,7 @@ mod tests {
 
         app.store.add_study(today, "rust", 480)?;
         app.reload()?;
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &app))?;
         let status = &terminal.backend().buffer().content()[240..320];
         let text: String = status.iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains("This week · Ahead by"));
@@ -1024,7 +536,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter))?;
         assert!(app.screen == Screen::GoalProgress);
         let mut terminal = Terminal::new(TestBackend::new(80, 16))?;
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &app))?;
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -1077,7 +589,7 @@ mod tests {
         assert!(app.screen == Screen::Dashboard);
         assert_eq!(app.active_timer.as_ref().unwrap().id, id);
         let mut terminal = Terminal::new(TestBackend::new(80, 16))?;
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &app))?;
         let title = terminal.backend().buffer().content()[80..160]
             .iter()
             .map(|cell| cell.symbol())
@@ -1136,7 +648,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
         let press = |app: &mut App, code| app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
 
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &app))?;
         assert_topic_rows(&terminal, &["chemistry", "algebra", "biology"]);
         let dashboard: String = terminal
             .backend()
@@ -1148,7 +660,7 @@ mod tests {
         assert!(!dashboard.contains("design"));
 
         press(&mut app, KeyCode::Char('a'))?;
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &app))?;
         assert_topic_rows(&terminal, &["chemistry", "algebra", "biology", "design"]);
 
         press(&mut app, KeyCode::Enter)?;
@@ -1205,7 +717,7 @@ mod tests {
             app.filtered_topics().collect::<Vec<_>>(),
             ["chemistry", "biology", "design"]
         );
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &app))?;
         assert_topic_rows(&terminal, &["chemistry", "biology", "design"]);
         for key in [
             KeyCode::Down,
@@ -1219,7 +731,7 @@ mod tests {
         assert_eq!(aggregate_current(&app.current)["biology"], 80 * 60_000);
 
         press(&mut app, KeyCode::Char('h'))?;
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &app))?;
         assert_topic_rows(&terminal, &["design", "algebra", "biology", "chemistry"]);
 
         press(&mut app, KeyCode::Right)?;
