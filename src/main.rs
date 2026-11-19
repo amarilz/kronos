@@ -571,6 +571,20 @@ fn format_duration(duration_ms: u64) -> String {
     }
 }
 
+fn format_goal_duration(duration_ms: u64, show_days: bool) -> String {
+    let total_minutes = duration_ms / 60_000;
+    if total_minutes == 0 && duration_ms > 0 {
+        return "<1m".into();
+    }
+    let hours = total_minutes / 60;
+    let minutes = total_minutes % 60;
+    if show_days && hours >= 24 {
+        format!("{}d {}h {minutes:02}m", hours / 24, hours % 24)
+    } else {
+        format!("{hours}h {minutes:02}m")
+    }
+}
+
 fn draw_goal_progress(
     frame: &mut ratatui::Frame<'_>,
     progress: &GoalProgress,
@@ -581,7 +595,7 @@ fn draw_goal_progress(
         GoalProgress::Scheduled(goal) => vec![Line::from(format!(
             "Plan starts on {} · {} per week",
             goal.starts_on,
-            format_duration(u64::from(goal.minutes_per_week) * 60_000)
+            format_goal_duration(u64::from(goal.minutes_per_week) * 60_000, false)
         ))],
         GoalProgress::Started {
             starts_on,
@@ -590,7 +604,13 @@ fn draw_goal_progress(
             studied_ms,
             expected_ms,
         } => {
-            let difference = format_duration(studied_ms.abs_diff(*expected_ms));
+            let weekly_goal_ms = u64::from(current_goal.minutes_per_week) * 60_000;
+            let difference_ms = studied_ms.abs_diff(*expected_ms);
+            let mut difference = format_goal_duration(difference_ms, false);
+            if difference_ms >= weekly_goal_ms {
+                let equivalent_weeks = difference_ms as f64 / weekly_goal_ms as f64;
+                difference.push_str(&format!(" (~{equivalent_weeks:.1} weeks at current goal)"));
+            }
             let (status, color) = match studied_ms.cmp(expected_ms) {
                 std::cmp::Ordering::Greater => (format!("Ahead by {difference}"), Color::Green),
                 std::cmp::Ordering::Less => (format!("Behind by {difference}"), Color::LightRed),
@@ -599,16 +619,19 @@ fn draw_goal_progress(
             let mut lines = vec![
                 Line::from(format!("Plan since {starts_on}")),
                 Line::from(format!(
-                    "Current weekly goal  {}",
-                    format_duration(u64::from(current_goal.minutes_per_week) * 60_000)
+                    "{:<24} {}",
+                    "Current weekly goal",
+                    format_goal_duration(weekly_goal_ms, false)
                 )),
                 Line::from(format!(
-                    "Total studied        {}",
-                    format_duration(*studied_ms)
+                    "{:<24} {}",
+                    "Total studied",
+                    format_goal_duration(*studied_ms, true)
                 )),
                 Line::from(format!(
-                    "Expected through today  {}",
-                    format_duration(*expected_ms)
+                    "{:<24} {}",
+                    "Expected through today",
+                    format_goal_duration(*expected_ms, true)
                 )),
                 Line::styled(
                     status,
@@ -617,8 +640,9 @@ fn draw_goal_progress(
             ];
             if let Some(goal) = next_goal {
                 lines.push(Line::from(format!(
-                    "Next weekly goal     {} from {}",
-                    format_duration(u64::from(goal.minutes_per_week) * 60_000),
+                    "{:<24} {} from {}",
+                    "Next weekly goal",
+                    format_goal_duration(u64::from(goal.minutes_per_week) * 60_000, false),
                     goal.starts_on,
                 )));
             }
@@ -628,7 +652,7 @@ fn draw_goal_progress(
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
-            .block(Block::bordered().title("Goal progress")),
+            .block(Block::bordered().title("Goal progress · 1d = 24h")),
         area,
     );
 }
