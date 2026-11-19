@@ -1,8 +1,7 @@
 //! SQLite schema migrations, embedded in the binary in ascending schema order.
 //!
-//! Name new scripts `NNNN_vX_Y_Z_description.sql` and append them to `SCHEMA_MIGRATIONS`.
-//! The prefix maps to SQLite's `user_version`; the app version records the release
-//! that introduced the change. Keep released scripts unchanged. The legacy scripts
+//! Name new scripts `NNNN_description.sql` and append them to `SCHEMA_MIGRATIONS`.
+//! The numeric prefix maps to SQLite's `user_version`. Keep released scripts unchanged. The legacy scripts
 //! only import databases from before Kronos tracked schema versions.
 
 use anyhow::{Context, Result, bail};
@@ -13,6 +12,7 @@ use std::sync::LazyLock;
 const DATABASE_APPLICATION_ID: i64 = 0x5354_5544;
 const V1_0_2_BASELINE_SCHEMA_VERSION: i64 = 1;
 const V1_0_3_TIMED_STUDY_SCHEMA_VERSION: i64 = 2;
+const WEEKLY_GOALS_SCHEMA_VERSION: i64 = 3;
 
 const V1_0_2_CREATE_INITIAL_STUDY_TABLES_SQL: &str =
     include_str!("../../migrations/0001_v1_0_2_create_initial_study_tables.sql");
@@ -22,6 +22,9 @@ static SCHEMA_MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
     Migrations::new(vec![
         M::up(V1_0_2_CREATE_INITIAL_STUDY_TABLES_SQL),
         M::up(V1_0_3_SUPPORT_TIMED_STUDY_ENTRIES_SQL),
+        M::up(include_str!(
+            "../../migrations/0003_create_weekly_goals.sql"
+        )),
     ])
 });
 
@@ -91,18 +94,18 @@ const V1_0_2_MANUAL_STUDY_COLUMNS: TableColumns = &[
 
 pub(super) fn initialize_new_database(connection: &mut Connection) -> Result<()> {
     SCHEMA_MIGRATIONS.to_latest(connection)?;
-    verify_columns(connection, V1_0_3_TIMED_STUDY_COLUMNS)
+    verify_weekly_goals_schema(connection)
 }
 
 pub(super) fn upgrade_existing_database(connection: &mut Connection) -> Result<()> {
     register_legacy_database_at_v1_0_2_baseline(connection)?;
     if let Err(error) = SCHEMA_MIGRATIONS.to_latest(connection) {
         // Another opener can finish the migration after the runner reads user_version.
-        if database_schema_version(connection)? != V1_0_3_TIMED_STUDY_SCHEMA_VERSION {
+        if database_schema_version(connection)? != WEEKLY_GOALS_SCHEMA_VERSION {
             return Err(error).context("Could not apply Kronos schema migrations");
         }
     }
-    verify_columns(connection, V1_0_3_TIMED_STUDY_COLUMNS)
+    verify_weekly_goals_schema(connection)
 }
 
 fn register_legacy_database_at_v1_0_2_baseline(connection: &mut Connection) -> Result<()> {
@@ -129,6 +132,7 @@ fn register_legacy_database_at_v1_0_2_baseline(connection: &mut Connection) -> R
                 verify_columns(&transaction, V1_0_3_TIMED_STUDY_COLUMNS)?;
             }
         }
+        WEEKLY_GOALS_SCHEMA_VERSION => verify_weekly_goals_schema(&transaction)?,
         version => bail!("Unsupported Kronos database schema version {version}"),
     }
     transaction.commit()?;
@@ -153,6 +157,17 @@ fn database_schema_version(connection: &Connection) -> Result<i64> {
     Ok(connection.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
 
+fn verify_weekly_goals_schema(connection: &Connection) -> Result<()> {
+    verify_columns(connection, V1_0_3_TIMED_STUDY_COLUMNS)?;
+    verify_columns(
+        connection,
+        &[(
+            "weekly_goals",
+            &[("starts_on", "TEXT"), ("minutes_per_week", "INTEGER")],
+        )],
+    )
+}
+
 fn verify_database(connection: &Connection) -> Result<()> {
     let quick_check: String =
         connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
@@ -166,7 +181,12 @@ fn verify_database(connection: &Connection) -> Result<()> {
         bail!("This file is not a Kronos database (application ID {application_id})");
     }
 
-    let expected_tables = ["daily_entries", "topics", "weekly_totals"];
+    let expected_tables: &[_] =
+        if database_schema_version(connection)? == WEEKLY_GOALS_SCHEMA_VERSION {
+            &["daily_entries", "topics", "weekly_goals", "weekly_totals"]
+        } else {
+            &["daily_entries", "topics", "weekly_totals"]
+        };
     let mut statement = connection.prepare(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     )?;
@@ -248,9 +268,41 @@ mod tests {
         initialize_new_database(&mut connection).unwrap();
         assert_eq!(
             database_schema_version(&connection).unwrap(),
-            V1_0_3_TIMED_STUDY_SCHEMA_VERSION
+            WEEKLY_GOALS_SCHEMA_VERSION
         );
         verify_database(&connection).unwrap();
+    }
+
+    #[test]
+    fn upgrading_v1_0_3_adds_goals_without_changing_an_open_timer() {
+        let directory = temporary_directory();
+        let path = directory.join("kronos.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        SCHEMA_MIGRATIONS
+            .to_version(&mut connection, V1_0_3_TIMED_STUDY_SCHEMA_VERSION as usize)
+            .unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO topics VALUES (1, 'rust');
+             INSERT INTO daily_entries(date, topic_id, started_at)
+             VALUES ('2026-11-16', 1, 1795000000000);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open_existing(&path).unwrap();
+        assert_eq!(
+            store.active_timer().unwrap().unwrap().started_at,
+            1795000000000
+        );
+        verify_weekly_goals_schema(&store.connection).unwrap();
+        assert_eq!(
+            database_schema_version(&store.connection).unwrap(),
+            WEEKLY_GOALS_SCHEMA_VERSION
+        );
+
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -326,7 +378,7 @@ mod tests {
             verify_columns(&store.connection, V1_0_3_TIMED_STUDY_COLUMNS).unwrap();
             assert_eq!(
                 database_schema_version(&store.connection).unwrap(),
-                V1_0_3_TIMED_STUDY_SCHEMA_VERSION
+                WEEKLY_GOALS_SCHEMA_VERSION
             );
         }
 

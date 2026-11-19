@@ -2,7 +2,9 @@ mod migrations;
 
 const MILLIS_PER_MINUTE: i64 = 60_000;
 
-use crate::model::{CurrentEntry, HistoryEntry, current_week, iso_week_key, week_start};
+use crate::model::{
+    CurrentEntry, HistoryEntry, WeeklyGoal, current_week, iso_week_key, week_start,
+};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc, Weekday};
 use rusqlite::{
@@ -131,6 +133,49 @@ impl Store {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn save_weekly_goal(&self, goal: WeeklyGoal) -> Result<()> {
+        if goal.starts_on != week_start(goal.starts_on) {
+            bail!("The goal must start on a Monday");
+        }
+        if !(1..=7 * 24 * 60).contains(&goal.minutes_per_week) {
+            bail!("Enter between 1 and 10080 minutes per week");
+        }
+        self.connection.execute(
+            "INSERT INTO weekly_goals(starts_on, minutes_per_week) VALUES (?1, ?2)
+             ON CONFLICT(starts_on) DO UPDATE SET minutes_per_week = excluded.minutes_per_week",
+            params![goal.starts_on.to_string(), goal.minutes_per_week],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_study_snapshot(
+        &self,
+    ) -> Result<(Vec<CurrentEntry>, Vec<HistoryEntry>, Vec<WeeklyGoal>)> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let daily_entries = self.load_current()?;
+        let history = self.load_history()?;
+        let weekly_goals = self.load_weekly_goals()?;
+        transaction.commit()?;
+        Ok((daily_entries, history, weekly_goals))
+    }
+
+    fn load_weekly_goals(&self) -> Result<Vec<WeeklyGoal>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT starts_on, minutes_per_week FROM weekly_goals ORDER BY starts_on")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })?;
+        rows.map(|row| {
+            let (date, minutes_per_week) = row?;
+            Ok(WeeklyGoal {
+                starts_on: parse_date(&date)?,
+                minutes_per_week,
+            })
+        })
+        .collect()
     }
 
     pub fn load_current(&self) -> Result<Vec<CurrentEntry>> {

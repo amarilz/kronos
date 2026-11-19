@@ -1,5 +1,5 @@
 use chrono::{Datelike, Duration, NaiveDate};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CurrentEntry {
@@ -14,6 +14,102 @@ pub struct HistoryEntry {
     pub iso_week: u32,
     pub topic: String,
     pub minutes: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct WeeklyGoal {
+    pub starts_on: NaiveDate,
+    pub minutes_per_week: u32,
+}
+
+impl WeeklyGoal {
+    pub fn expected_ms_for_days(self, days: u64) -> u64 {
+        u64::from(self.minutes_per_week) * 60_000 * days / 7
+    }
+}
+
+pub enum GoalProgress {
+    NoGoal,
+    Scheduled(WeeklyGoal),
+    Started {
+        starts_on: NaiveDate,
+        current_goal: WeeklyGoal,
+        next_goal: Option<WeeklyGoal>,
+        studied_ms: u64,
+        expected_ms: u64,
+    },
+}
+
+pub fn summarize_goals(
+    today: NaiveDate,
+    goals: &[WeeklyGoal],
+    daily_entries: &[CurrentEntry],
+    weekly_totals: &[HistoryEntry],
+) -> GoalProgress {
+    let Some(first_goal) = goals.first() else {
+        return GoalProgress::NoGoal;
+    };
+    if first_goal.starts_on > today {
+        return GoalProgress::Scheduled(*first_goal);
+    }
+
+    const MS_PER_MINUTE: u64 = 60_000;
+    let mut current_goal = *first_goal;
+    let mut expected_ms = 0;
+    for (index, goal) in goals
+        .iter()
+        .enumerate()
+        .take_while(|(_, goal)| goal.starts_on <= today)
+    {
+        let days = match goals.get(index + 1).filter(|next| next.starts_on <= today) {
+            Some(next) => (next.starts_on - goal.starts_on).num_days(),
+            None => (today - goal.starts_on).num_days() + 1,
+        };
+        expected_ms += goal.expected_ms_for_days(days as u64);
+        current_goal = *goal;
+    }
+
+    let first_week = iso_week_key(first_goal.starts_on);
+    let current_week = iso_week_key(today);
+    let archived_ms: u64 = weekly_totals
+        .iter()
+        .filter(|entry| (first_week..current_week).contains(&(entry.iso_year, entry.iso_week)))
+        .map(|entry| u64::from(entry.minutes) * MS_PER_MINUTE)
+        .sum();
+    let daily_ms: u64 = daily_entries
+        .iter()
+        .filter(|entry| (first_goal.starts_on..=today).contains(&entry.date))
+        .map(|entry| entry.duration_ms)
+        .sum();
+
+    GoalProgress::Started {
+        starts_on: first_goal.starts_on,
+        current_goal,
+        next_goal: goals.iter().find(|goal| goal.starts_on > today).copied(),
+        studied_ms: archived_ms + daily_ms,
+        expected_ms,
+    }
+}
+
+pub fn history_weeks(
+    today: NaiveDate,
+    archived: &[HistoryEntry],
+    pending: &[CurrentEntry],
+) -> Vec<(i32, u32)> {
+    let current_week = iso_week_key(today);
+    let weeks: BTreeSet<_> = archived
+        .iter()
+        .filter(|entry| entry.minutes > 0)
+        .map(|entry| (entry.iso_year, entry.iso_week))
+        .chain(
+            pending
+                .iter()
+                .filter(|entry| entry.duration_ms > 0)
+                .map(|entry| iso_week_key(entry.date)),
+        )
+        .filter(|week| *week < current_week)
+        .collect();
+    weeks.into_iter().rev().collect()
 }
 
 pub fn week_start(date: NaiveDate) -> NaiveDate {
@@ -50,6 +146,65 @@ pub fn aggregate_history(entries: &[HistoryEntry]) -> BTreeMap<String, u32> {
 mod tests {
     use super::*;
     use chrono::Weekday;
+
+    #[test]
+    fn progress_includes_empty_weeks_and_prorates_the_current_goal() {
+        let date = |month, day| NaiveDate::from_ymd_opt(2026, month, day).unwrap();
+        let goals = [
+            WeeklyGoal {
+                starts_on: date(1, 5),
+                minutes_per_week: 420,
+            },
+            WeeklyGoal {
+                starts_on: date(1, 19),
+                minutes_per_week: 840,
+            },
+            WeeklyGoal {
+                starts_on: date(1, 26),
+                minutes_per_week: 600,
+            },
+        ];
+        let archive = [
+            HistoryEntry {
+                iso_year: 2026,
+                iso_week: 1,
+                topic: "rust".into(),
+                minutes: 30,
+            },
+            HistoryEntry {
+                iso_year: 2026,
+                iso_week: 2,
+                topic: "rust".into(),
+                minutes: 90,
+            },
+        ];
+        let daily = [
+            CurrentEntry {
+                date: date(1, 11),
+                topic: "rust".into(),
+                duration_ms: 25_000,
+            },
+            CurrentEntry {
+                date: date(1, 21),
+                topic: "rust".into(),
+                duration_ms: 3_600_000,
+            },
+        ];
+        let GoalProgress::Started {
+            studied_ms,
+            expected_ms,
+            current_goal,
+            next_goal,
+            ..
+        } = summarize_goals(date(1, 21), &goals, &daily, &archive)
+        else {
+            panic!("the goal plan has already started");
+        };
+        assert_eq!(studied_ms, (90 + 60) * 60_000 + 25_000);
+        assert_eq!(expected_ms, (2 * 420 + 3 * 120) * 60_000);
+        assert_eq!(current_goal.minutes_per_week, 840);
+        assert_eq!(next_goal.unwrap().minutes_per_week, 600);
+    }
 
     #[test]
     fn weeks_start_on_monday_even_across_year_boundary() {
