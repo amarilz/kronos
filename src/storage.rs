@@ -3,8 +3,7 @@ mod migrations;
 const MILLIS_PER_MINUTE: i64 = 60_000;
 
 use crate::model::{
-    CurrentEntry, GoalProgress, HistoryEntry, WeeklyGoal, current_week, iso_week_key,
-    summarize_goals, week_start,
+    CurrentEntry, HistoryEntry, WeeklyGoal, current_week, iso_week_key, week_start,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc, Weekday};
@@ -151,33 +150,32 @@ impl Store {
         Ok(())
     }
 
-    pub fn goal_progress(&self, today: NaiveDate) -> Result<GoalProgress> {
+    pub fn load_study_snapshot(
+        &self,
+    ) -> Result<(Vec<CurrentEntry>, Vec<HistoryEntry>, Vec<WeeklyGoal>)> {
         let transaction = self.connection.unchecked_transaction()?;
-        let goals = {
-            let mut statement = transaction.prepare(
-                "SELECT starts_on, minutes_per_week FROM weekly_goals ORDER BY starts_on",
-            )?;
-            let rows = statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
-            })?;
-            rows.map(|row| {
-                let (date, minutes_per_week) = row?;
-                Ok(WeeklyGoal {
-                    starts_on: parse_date(&date)?,
-                    minutes_per_week,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?
-        };
         let daily_entries = self.load_current()?;
-        let weekly_totals = self.load_history()?;
+        let history = self.load_history()?;
+        let weekly_goals = self.load_weekly_goals()?;
         transaction.commit()?;
-        Ok(summarize_goals(
-            today,
-            &goals,
-            &daily_entries,
-            &weekly_totals,
-        ))
+        Ok((daily_entries, history, weekly_goals))
+    }
+
+    fn load_weekly_goals(&self) -> Result<Vec<WeeklyGoal>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT starts_on, minutes_per_week FROM weekly_goals ORDER BY starts_on")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })?;
+        rows.map(|row| {
+            let (date, minutes_per_week) = row?;
+            Ok(WeeklyGoal {
+                starts_on: parse_date(&date)?,
+                minutes_per_week,
+            })
+        })
+        .collect()
     }
 
     pub fn load_current(&self) -> Result<Vec<CurrentEntry>> {

@@ -11,7 +11,10 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use model::{CurrentEntry, GoalProgress, HistoryEntry, aggregate_current, week_start};
+use model::{
+    CurrentEntry, GoalProgress, HistoryEntry, WeeklyGoal, aggregate_current, history_weeks,
+    summarize_goals, week_start,
+};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     cmp::Reverse,
@@ -42,6 +45,8 @@ struct App {
     studied_topic_count: usize,
     current: Vec<CurrentEntry>,
     history: Vec<HistoryEntry>,
+    pending_history: Vec<CurrentEntry>,
+    weekly_goals: Vec<WeeklyGoal>,
     screen: Screen,
     selected: usize,
     date_field: usize,
@@ -71,6 +76,8 @@ impl App {
             studied_topic_count: 0,
             current: Vec::new(),
             history: Vec::new(),
+            pending_history: Vec::new(),
+            weekly_goals: Vec::new(),
             screen: Screen::Dashboard,
             selected: 0,
             date_field: 0,
@@ -101,9 +108,14 @@ impl App {
         self.store.rollover_if_needed(today)?;
         self.active_timer = self.store.active_timer()?;
         self.topics = self.store.topics()?;
-        self.current = self.store.load_current()?;
+        let (daily_entries, history, weekly_goals) = self.store.load_study_snapshot()?;
+        self.goal_progress = summarize_goals(today, &weekly_goals, &daily_entries, &history);
         let monday = week_start(today);
-        self.current.retain(|entry| entry.date >= monday);
+        (self.current, self.pending_history) = daily_entries
+            .into_iter()
+            .partition(|entry| entry.date >= monday);
+        self.history = history;
+        self.weekly_goals = weekly_goals;
         let totals = aggregate_current(&self.current);
         self.studied_topic_count = totals
             .values()
@@ -112,17 +124,8 @@ impl App {
         // Stable sorting keeps the store's alphabetical order for equal totals.
         self.topics
             .sort_by_key(|topic| Reverse(totals.get(topic).copied().unwrap_or(0)));
-        self.history = self.store.load_history()?;
-        self.goal_progress = self.store.goal_progress(today)?;
         self.snapshot_date = today;
-        self.history_weeks = self
-            .history
-            .iter()
-            .map(|entry| (entry.iso_year, entry.iso_week))
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+        self.history_weeks = history_weeks(today, &self.history, &self.pending_history);
         self.selected = self
             .selected
             .min(self.studied_topic_count.saturating_sub(1));
@@ -186,6 +189,7 @@ impl App {
                 }
                 KeyCode::Char('g') => self.open_goal_progress()?,
                 KeyCode::Char('h') => {
+                    self.reload()?;
                     self.history_index = 0;
                     self.screen = Screen::History;
                 }
@@ -308,7 +312,7 @@ impl App {
     }
 
     fn open_goal_progress(&mut self) -> Result<()> {
-        self.goal_progress = self.store.goal_progress(Local::now().date_naive())?;
+        self.reload()?;
         self.screen = Screen::GoalProgress;
         Ok(())
     }
@@ -478,8 +482,56 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use crossterm::event::KeyModifiers;
-    use model::WeeklyGoal;
     use ratatui::{backend::TestBackend, style::Color};
+
+    #[test]
+    fn history_shows_each_weeks_goal_and_colors_its_balance() -> Result<()> {
+        let directory = storage::tests::temporary_directory();
+        let mut store = Store::create_new(&directory.join("kronos.sqlite3"))?;
+        let monday = week_start(Local::now().date_naive());
+        let last_week = monday - Duration::weeks(1);
+        let first_week = monday - Duration::weeks(3);
+        store.add_topic("rust")?;
+        store.save_weekly_goal(WeeklyGoal {
+            starts_on: first_week,
+            minutes_per_week: 300,
+        })?;
+        store.save_weekly_goal(WeeklyGoal {
+            starts_on: last_week,
+            minutes_per_week: 420,
+        })?;
+        store.add_study(first_week, "rust", 330)?;
+        store.add_study(last_week, "rust", 60)?;
+        let mut app = App::new(store)?;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.handle_key(key(KeyCode::Char('h')))?;
+        assert_eq!(
+            app.history_weeks,
+            [
+                model::iso_week_key(last_week),
+                model::iso_week_key(first_week)
+            ]
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 16))?;
+
+        for (goal, balance, color) in [
+            ("7h 00m", "Behind by 6h 00m", Color::LightRed),
+            ("5h 00m", "Ahead by 0h 30m", Color::Green),
+        ] {
+            terminal.draw(|frame| ui::draw(frame, &app))?;
+            let buffer = terminal.backend().buffer().content();
+            let goal_row: String = buffer[400..480].iter().map(|cell| cell.symbol()).collect();
+            let balance_row: String = buffer[480..560].iter().map(|cell| cell.symbol()).collect();
+            assert!(goal_row.contains(&format!("Weekly goal  {goal}")));
+            assert!(balance_row.contains(balance));
+            assert_eq!(buffer[481].fg, color);
+            app.handle_key(key(KeyCode::Left))?;
+        }
+
+        drop(app);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
 
     #[test]
     fn dashboard_colors_the_weekly_balance_independently_of_the_plan_balance() -> Result<()> {

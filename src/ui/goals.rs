@@ -36,7 +36,7 @@ pub(crate) fn draw_editor(frame: &mut Frame<'_>, input: &str, area: Rect) {
     );
 }
 
-fn format_goal_duration(duration_ms: u64, show_days: bool) -> String {
+pub(super) fn format_goal_duration(duration_ms: u64, show_days: bool) -> String {
     let total_minutes = duration_ms / 60_000;
     if total_minutes == 0 && duration_ms > 0 {
         return "<1m".into();
@@ -137,21 +137,35 @@ pub(crate) fn draw_weekly_balance(
     if let GoalProgress::Started { current_goal, .. } = progress {
         let days_elapsed = u64::from(today.weekday().number_from_monday());
         let expected_ms = current_goal.expected_ms_for_days(days_elapsed);
-        let (label, color) = goal_balance(total, expected_ms);
-        let balance = if total == expected_ms {
-            format!("  This week · {label}")
-        } else {
-            let difference = format_goal_duration(total.abs_diff(expected_ms), false);
-            format!("  This week · {label} {difference}")
-        };
         let [status, study_list] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
         frame.render_widget(
-            Paragraph::new(balance).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Paragraph::new(weekly_balance_line("  This week · ", total, expected_ms)),
             status,
         );
         study_list
     } else {
         area
     }
+}
+
+pub(super) fn weekly_balance_line(
+    prefix: &str,
+    studied_ms: u64,
+    expected_ms: u64,
+) -> Line<'static> {
+    let (label, color) = goal_balance(studied_ms, expected_ms);
+    let difference = studied_ms.abs_diff(expected_ms);
+    let text = if difference == 0 {
+        format!("{prefix}{label}")
+    } else {
+        format!(
+            "{prefix}{label} {}",
+            format_goal_duration(difference, false)
+        )
+    };
+    Line::styled(
+        text,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
 }

@@ -1,5 +1,5 @@
 use chrono::{Datelike, Duration, NaiveDate};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CurrentEntry {
@@ -89,6 +89,27 @@ pub fn summarize_goals(
         studied_ms: archived_ms + daily_ms,
         expected_ms,
     }
+}
+
+pub fn history_weeks(
+    today: NaiveDate,
+    archived: &[HistoryEntry],
+    pending: &[CurrentEntry],
+) -> Vec<(i32, u32)> {
+    let current_week = iso_week_key(today);
+    let weeks: BTreeSet<_> = archived
+        .iter()
+        .filter(|entry| entry.minutes > 0)
+        .map(|entry| (entry.iso_year, entry.iso_week))
+        .chain(
+            pending
+                .iter()
+                .filter(|entry| entry.duration_ms > 0)
+                .map(|entry| iso_week_key(entry.date)),
+        )
+        .filter(|week| *week < current_week)
+        .collect();
+    weeks.into_iter().rev().collect()
 }
 
 pub fn week_start(date: NaiveDate) -> NaiveDate {

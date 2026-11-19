@@ -66,12 +66,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         Screen::DateSelect => study_entry::draw_date_select(frame, app, areas[1]),
         Screen::Duration => study_entry::draw_duration(frame, app, areas[1]),
         Screen::AddTopic => study_entry::draw_add_topic(frame, &app.topic_input, areas[1]),
-        Screen::History => history::draw(
-            frame,
-            &app.history,
-            app.history_weeks.get(app.history_index).copied(),
-            areas[1],
-        ),
+        Screen::History => history::draw(frame, app, areas[1]),
         Screen::GoalProgress => goals::draw_progress(frame, &app.goal_progress, areas[1]),
         Screen::EditGoal => goals::draw_editor(frame, &app.goal_input, areas[1]),
     }
