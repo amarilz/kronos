@@ -4,7 +4,7 @@ mod storage;
 mod ui;
 
 use anyhow::{Context, Result, bail};
-use chrono::{Local, Months, NaiveDate, Utc};
+use chrono::{DateTime, Local, Months, NaiveDate, Utc};
 use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
@@ -20,7 +20,7 @@ use std::{
     cmp::Reverse,
     io::{self, Stdout},
     path::PathBuf,
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant},
 };
 use storage::{ActiveTimer, Store};
 
@@ -46,6 +46,13 @@ const HOME_ACTIONS: [(&str, char); 5] = [
     ("Quit", 'q'),
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResumeAction {
+    Continue,
+    Save,
+    Discard,
+}
+
 struct App {
     store: Store,
     active_timer: Option<ActiveTimer>,
@@ -59,7 +66,7 @@ struct App {
     selected: usize,
     home_selection: usize,
     dashboard_scroll: usize,
-    resume_discard: bool,
+    resume_selection: usize,
     timer_quit: bool,
     topic_creation_origin: Screen,
     study_topic: String,
@@ -95,7 +102,7 @@ impl App {
             selected: 0,
             home_selection: 0,
             dashboard_scroll: 0,
-            resume_discard: false,
+            resume_selection: 0,
             timer_quit: false,
             topic_creation_origin: Screen::Dashboard,
             study_topic: String::new(),
@@ -119,6 +126,50 @@ impl App {
             app.screen = Screen::ResumeTimer;
         }
         Ok(app)
+    }
+
+    fn resume_actions(&self) -> &[ResumeAction] {
+        if self
+            .active_timer
+            .as_ref()
+            .and_then(ActiveTimer::last_seen)
+            .is_some()
+        {
+            &[
+                ResumeAction::Continue,
+                ResumeAction::Save,
+                ResumeAction::Discard,
+            ]
+        } else {
+            &[ResumeAction::Continue, ResumeAction::Discard]
+        }
+    }
+
+    fn checkpoint_timer(&self, now: DateTime<Utc>) -> Result<()> {
+        if self.screen != Screen::ResumeTimer
+            && let Some(timer) = &self.active_timer
+        {
+            self.store.checkpoint_timer(timer.id, now)?;
+        }
+        Ok(())
+    }
+
+    fn save_timer(&mut self, id: i64, ended_at: DateTime<Utc>) -> Result<()> {
+        let result = self.store.stop_timer(id, ended_at)?;
+        self.reload()?;
+        if self.active_timer.is_none() {
+            self.screen = Screen::Dashboard;
+        } else {
+            self.screen = Screen::ResumeTimer;
+            self.resume_selection = 0;
+        }
+        self.message = match result {
+            Some(duration_ms) => {
+                format!("Timer saved · {}", ui::format_duration(duration_ms as u64))
+            }
+            None => "This timer was already stopped".into(),
+        };
+        Ok(())
     }
 
     fn reload(&mut self) -> Result<()> {
@@ -173,15 +224,7 @@ impl App {
                 KeyCode::Tab | KeyCode::BackTab => self.timer_quit = !self.timer_quit,
                 KeyCode::Enter if self.timer_quit => self.quit = true,
                 KeyCode::Enter | KeyCode::Char('m') if key.kind == KeyEventKind::Press => {
-                    let result = self.store.stop_timer(timer.id, Utc::now())?;
-                    self.screen = Screen::Dashboard;
-                    self.reload()?;
-                    self.message = match result {
-                        Some(duration_ms) => {
-                            format!("Timer saved · {}", ui::format_duration(duration_ms as u64))
-                        }
-                        None => "This timer was already stopped".into(),
-                    };
+                    self.save_timer(timer.id, Utc::now())?;
                 }
                 KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
                 _ => {}
@@ -191,26 +234,48 @@ impl App {
 
         match self.screen {
             Screen::ResumeTimer => match key.code {
-                KeyCode::Left | KeyCode::Up => self.resume_discard = false,
-                KeyCode::Right | KeyCode::Down => self.resume_discard = true,
-                KeyCode::Tab | KeyCode::BackTab => self.resume_discard = !self.resume_discard,
-                KeyCode::Enter | KeyCode::Char('y' | 'Y' | 'n' | 'N')
+                KeyCode::Left | KeyCode::Up | KeyCode::BackTab => {
+                    let count = self.resume_actions().len();
+                    self.resume_selection = (self.resume_selection + count - 1) % count;
+                }
+                KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+                    self.resume_selection =
+                        (self.resume_selection + 1) % self.resume_actions().len();
+                }
+                KeyCode::Enter | KeyCode::Char('y' | 'Y' | 's' | 'S' | 'n' | 'N')
                     if key.kind == KeyEventKind::Press =>
                 {
-                    let pending_id = self.active_timer.as_ref().map(|timer| timer.id);
-                    let discard = match key.code {
-                        KeyCode::Enter => self.resume_discard,
-                        _ => matches!(key.code, KeyCode::Char('n' | 'N')),
-                    };
-                    if discard && let Some(id) = pending_id {
-                        self.store.discard_timer(id)?;
-                    }
-                    self.reload()?;
-                    if self.active_timer.is_none()
-                        || (!discard
-                            && self.active_timer.as_ref().map(|timer| timer.id) == pending_id)
-                    {
-                        self.screen = Screen::Dashboard;
+                    if let Some(timer) = &self.active_timer {
+                        let action = match key.code {
+                            KeyCode::Char('y' | 'Y') => ResumeAction::Continue,
+                            KeyCode::Char('s' | 'S') => ResumeAction::Save,
+                            KeyCode::Char('n' | 'N') => ResumeAction::Discard,
+                            _ => self.resume_actions()[self.resume_selection],
+                        };
+                        match action {
+                            ResumeAction::Save => {
+                                if let Some(ended_at) = timer.last_seen() {
+                                    self.save_timer(timer.id, ended_at)?;
+                                }
+                            }
+                            ResumeAction::Continue | ResumeAction::Discard => {
+                                let id = timer.id;
+                                if action == ResumeAction::Continue {
+                                    self.store.checkpoint_timer(id, Utc::now())?;
+                                } else {
+                                    self.store.discard_timer(id)?;
+                                }
+                                self.reload()?;
+                                self.resume_selection = 0;
+                                if self.active_timer.is_none()
+                                    || (action == ResumeAction::Continue
+                                        && self.active_timer.as_ref().map(|timer| timer.id)
+                                            == Some(id))
+                                {
+                                    self.screen = Screen::Dashboard;
+                                }
+                            }
+                        }
                     }
                 }
                 KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
@@ -527,7 +592,14 @@ fn run(mut app: App) -> Result<()> {
 }
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+    let mut last_checkpoint = Instant::now();
     while !app.quit {
+        if last_checkpoint.elapsed() >= StdDuration::from_secs(5) {
+            last_checkpoint = Instant::now();
+            if let Err(error) = app.checkpoint_timer(Utc::now()) {
+                app.message = format!("Could not save timer checkpoint · {error}");
+            }
+        }
         if matches!(app.screen, Screen::Dashboard | Screen::GoalProgress)
             && app.snapshot_date != Local::now().date_naive()
         {
@@ -688,6 +760,42 @@ mod tests {
     }
 
     #[test]
+    fn recovered_timer_saves_the_last_checkpoint_without_counting_time_away() -> Result<()> {
+        let directory = storage::tests::temporary_directory();
+        let database = directory.join("kronos.sqlite3");
+        let mut store = Store::create_new(&database)?;
+        store.add_topic("rust")?;
+        let started_at = Utc::now() - Duration::seconds(12);
+        let checkpoint = started_at + Duration::milliseconds(5_123);
+        let press = |app: &mut App, code| app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        store.start_timer("rust", started_at)?;
+        let timer = store.active_timer()?.unwrap();
+        store.checkpoint_timer(timer.id, checkpoint)?;
+        drop(store);
+
+        let mut app = App::new(Store::open_existing(&database)?)?;
+        assert!(app.screen == Screen::ResumeTimer);
+        press(&mut app, KeyCode::Char('q'))?;
+        drop(app);
+
+        let mut app = App::new(Store::open_existing(&database)?)?;
+        let timer = app.active_timer.as_ref().unwrap();
+        assert_eq!(
+            timer.last_seen(),
+            DateTime::from_timestamp_millis(checkpoint.timestamp_millis())
+        );
+        press(&mut app, KeyCode::Right)?;
+        press(&mut app, KeyCode::Enter)?;
+        assert!(app.screen == Screen::Dashboard);
+        assert!(app.active_timer.is_none());
+        assert_eq!(app.message, "Timer saved · 00:00:05.123");
+
+        drop(app);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
     fn dashboard_can_start_and_stop_a_recovered_timer() -> Result<()> {
         let directory = storage::tests::temporary_directory();
         let database = directory.join("kronos.sqlite3");
@@ -725,8 +833,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(prompt.contains("Continue the running timer"));
-        assert!(prompt.contains("y Continue   n Discard"));
+        assert!(prompt.contains("Last checkpoint at"));
+        assert!(prompt.contains("y Continue   s Save checkpoint   n Discard"));
         assert!(prompt.contains("Esc Quit"));
 
         press(&mut app, KeyCode::Enter)?;
@@ -763,7 +871,7 @@ mod tests {
         drop(app);
         let mut app = App::new(Store::open_existing(&database)?)?;
         assert!(app.screen == Screen::ResumeTimer);
-        press(&mut app, KeyCode::Right)?;
+        press(&mut app, KeyCode::Left)?;
         press(&mut app, KeyCode::Enter)?;
         assert!(app.screen == Screen::Dashboard);
         assert!(app.store.active_timer()?.is_none());

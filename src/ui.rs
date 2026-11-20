@@ -4,8 +4,8 @@ mod history;
 pub(crate) mod setup;
 pub(crate) mod study_entry;
 
-use crate::{App, Screen};
-use chrono::Utc;
+use crate::{App, ResumeAction, Screen};
+use chrono::{DateTime, Local, Utc};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
@@ -19,7 +19,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         && let Some(timer) = &app.active_timer
     {
         let seconds = timer.elapsed_seconds(Utc::now());
-        let clock = format_duration(seconds as u64 * 1000);
+        let clock = format_duration(seconds * 1000);
         let mut lines = vec![
             Line::from(format!("Timer running · {}", timer.topic)),
             Line::from(clock),
@@ -55,17 +55,58 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         Screen::Dashboard => dashboard::draw(frame, app, content),
         Screen::ResumeTimer => {
             if let Some(timer) = &app.active_timer {
-                let prompt = Paragraph::new(vec![
-                    Line::from(format!(
-                        "Continue the running timer for \"{}\"?",
-                        timer.topic
-                    )),
-                    Line::from("Discarding deletes the session without adding study time."),
-                    Line::default(),
-                    choice_line("y Continue", "n Discard", app.resume_discard),
-                ])
-                .wrap(Wrap { trim: true })
-                .block(Block::bordered().title("Resume study timer"));
+                let now = Utc::now();
+                let local_time = |time: DateTime<Utc>| {
+                    time.with_timezone(&Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                };
+                let mut lines = vec![Line::from(format!("Study timer for \"{}\"", timer.topic))];
+                if let Some(start) = DateTime::from_timestamp_millis(timer.started_at) {
+                    lines.push(Line::from(format!("Started at {}", local_time(start))));
+                }
+                if let Some(last_seen) = timer.last_seen() {
+                    lines.push(Line::from(format!(
+                        "Last checkpoint at {} · {} elapsed",
+                        local_time(last_seen),
+                        format_duration(timer.elapsed_ms(last_seen)),
+                    )));
+                } else {
+                    lines.push(Line::from("No previous checkpoint available."));
+                }
+                lines.push(Line::from(format!(
+                    "Now {} · {} elapsed",
+                    local_time(now),
+                    format_duration(timer.elapsed_seconds(now) * 1000),
+                )));
+                lines.push(Line::from(
+                    "Continuing includes time while Kronos was closed.",
+                ));
+                lines.push(Line::default());
+                let mut choices = Vec::new();
+                for (index, action) in app.resume_actions().iter().enumerate() {
+                    if index > 0 {
+                        choices.push(Span::raw("   "));
+                    }
+                    let label = match action {
+                        ResumeAction::Continue => "y Continue",
+                        ResumeAction::Save => "s Save checkpoint",
+                        ResumeAction::Discard => "n Discard",
+                    };
+                    let style = if index == app.resume_selection {
+                        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    choices.push(Span::styled(label, style));
+                }
+                lines.push(Line::from(choices));
+                if !app.message.is_empty() {
+                    lines.push(Line::from(app.message.as_str()));
+                }
+                let prompt = Paragraph::new(lines)
+                    .wrap(Wrap { trim: true })
+                    .block(Block::bordered().title("Resume study timer"));
                 frame.render_widget(prompt, content);
             }
         }

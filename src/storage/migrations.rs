@@ -13,6 +13,7 @@ const DATABASE_APPLICATION_ID: i64 = 0x5354_5544;
 const V1_0_2_BASELINE_SCHEMA_VERSION: i64 = 1;
 const V1_0_3_TIMED_STUDY_SCHEMA_VERSION: i64 = 2;
 const WEEKLY_GOALS_SCHEMA_VERSION: i64 = 3;
+const TIMER_CHECKPOINT_SCHEMA_VERSION: i64 = 4;
 
 const V1_0_2_CREATE_INITIAL_STUDY_TABLES_SQL: &str =
     include_str!("../../migrations/0001_v1_0_2_create_initial_study_tables.sql");
@@ -24,6 +25,9 @@ static SCHEMA_MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(V1_0_3_SUPPORT_TIMED_STUDY_ENTRIES_SQL),
         M::up(include_str!(
             "../../migrations/0003_create_weekly_goals.sql"
+        )),
+        M::up(include_str!(
+            "../../migrations/0004_track_timer_checkpoints.sql"
         )),
     ])
 });
@@ -94,18 +98,18 @@ const V1_0_2_MANUAL_STUDY_COLUMNS: TableColumns = &[
 
 pub(super) fn initialize_new_database(connection: &mut Connection) -> Result<()> {
     SCHEMA_MIGRATIONS.to_latest(connection)?;
-    verify_weekly_goals_schema(connection)
+    verify_schema(connection, true)
 }
 
 pub(super) fn upgrade_existing_database(connection: &mut Connection) -> Result<()> {
     register_legacy_database_at_v1_0_2_baseline(connection)?;
     if let Err(error) = SCHEMA_MIGRATIONS.to_latest(connection) {
         // Another opener can finish the migration after the runner reads user_version.
-        if database_schema_version(connection)? != WEEKLY_GOALS_SCHEMA_VERSION {
+        if database_schema_version(connection)? != TIMER_CHECKPOINT_SCHEMA_VERSION {
             return Err(error).context("Could not apply Kronos schema migrations");
         }
     }
-    verify_weekly_goals_schema(connection)
+    verify_schema(connection, true)
 }
 
 fn register_legacy_database_at_v1_0_2_baseline(connection: &mut Connection) -> Result<()> {
@@ -132,7 +136,8 @@ fn register_legacy_database_at_v1_0_2_baseline(connection: &mut Connection) -> R
                 verify_columns(&transaction, V1_0_3_TIMED_STUDY_COLUMNS)?;
             }
         }
-        WEEKLY_GOALS_SCHEMA_VERSION => verify_weekly_goals_schema(&transaction)?,
+        WEEKLY_GOALS_SCHEMA_VERSION => verify_schema(&transaction, false)?,
+        TIMER_CHECKPOINT_SCHEMA_VERSION => verify_schema(&transaction, true)?,
         version => bail!("Unsupported Kronos database schema version {version}"),
     }
     transaction.commit()?;
@@ -157,8 +162,14 @@ fn database_schema_version(connection: &Connection) -> Result<i64> {
     Ok(connection.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
 
-fn verify_weekly_goals_schema(connection: &Connection) -> Result<()> {
-    verify_columns(connection, V1_0_3_TIMED_STUDY_COLUMNS)?;
+fn verify_schema(connection: &Connection, timer_checkpoints: bool) -> Result<()> {
+    let mut columns: Vec<(&str, &[(&str, &str)])> = V1_0_3_TIMED_STUDY_COLUMNS.to_vec();
+    let mut daily_columns = columns[1].1.to_vec();
+    if timer_checkpoints {
+        daily_columns.push(("last_seen_at", "INTEGER"));
+    }
+    columns[1].1 = &daily_columns;
+    verify_columns(connection, &columns)?;
     verify_columns(
         connection,
         &[(
@@ -182,7 +193,7 @@ fn verify_database(connection: &Connection) -> Result<()> {
     }
 
     let expected_tables: &[_] =
-        if database_schema_version(connection)? == WEEKLY_GOALS_SCHEMA_VERSION {
+        if database_schema_version(connection)? >= WEEKLY_GOALS_SCHEMA_VERSION {
             &["daily_entries", "topics", "weekly_goals", "weekly_totals"]
         } else {
             &["daily_entries", "topics", "weekly_totals"]
@@ -210,7 +221,10 @@ fn table_columns(connection: &Connection, table: &str) -> Result<Vec<(String, St
     Ok(columns)
 }
 
-fn verify_columns(connection: &Connection, expected_columns: TableColumns) -> Result<()> {
+fn verify_columns(
+    connection: &Connection,
+    expected_columns: &[(&str, &[(&str, &str)])],
+) -> Result<()> {
     for (table, expected) in expected_columns {
         let actual = table_columns(connection, table)?;
         if actual
@@ -268,7 +282,7 @@ mod tests {
         initialize_new_database(&mut connection).unwrap();
         assert_eq!(
             database_schema_version(&connection).unwrap(),
-            WEEKLY_GOALS_SCHEMA_VERSION
+            TIMER_CHECKPOINT_SCHEMA_VERSION
         );
         verify_database(&connection).unwrap();
     }
@@ -291,14 +305,13 @@ mod tests {
         drop(connection);
 
         let store = Store::open_existing(&path).unwrap();
-        assert_eq!(
-            store.active_timer().unwrap().unwrap().started_at,
-            1795000000000
-        );
-        verify_weekly_goals_schema(&store.connection).unwrap();
+        let timer = store.active_timer().unwrap().unwrap();
+        assert_eq!(timer.started_at, 1795000000000);
+        assert_eq!(timer.last_seen_at, None);
+        verify_schema(&store.connection, true).unwrap();
         assert_eq!(
             database_schema_version(&store.connection).unwrap(),
-            WEEKLY_GOALS_SCHEMA_VERSION
+            TIMER_CHECKPOINT_SCHEMA_VERSION
         );
 
         drop(store);
@@ -375,10 +388,10 @@ mod tests {
             assert_eq!(store.load_current().unwrap()[0].duration_ms, 15 * 60_000);
             assert_eq!(store.load_history().unwrap()[0].minutes, 60);
             assert!(store.active_timer().unwrap().is_none());
-            verify_columns(&store.connection, V1_0_3_TIMED_STUDY_COLUMNS).unwrap();
+            verify_schema(&store.connection, true).unwrap();
             assert_eq!(
                 database_schema_version(&store.connection).unwrap(),
-                WEEKLY_GOALS_SCHEMA_VERSION
+                TIMER_CHECKPOINT_SCHEMA_VERSION
             );
         }
 
