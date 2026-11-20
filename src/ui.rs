@@ -65,44 +65,53 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
                 if let Some(start) = DateTime::from_timestamp_millis(timer.started_at) {
                     lines.push(Line::from(format!("Started at {}", local_time(start))));
                 }
-                if let Some(last_seen) = timer.last_seen() {
+                let checkpoint = timer.last_seen();
+                if let Some(last_seen) = checkpoint {
                     lines.push(Line::from(format!(
-                        "Last checkpoint at {} · {} elapsed",
-                        local_time(last_seen),
-                        format_duration(timer.elapsed_ms(last_seen)),
+                        "Last checkpoint at {}",
+                        local_time(last_seen)
                     )));
-                } else {
-                    lines.push(Line::from("No previous checkpoint available."));
                 }
-                lines.push(Line::from(format!(
-                    "Now {} · {} elapsed",
-                    local_time(now),
-                    format_duration(timer.elapsed_seconds(now) * 1000),
-                )));
-                lines.push(Line::from(
-                    "Continuing includes time while Kronos was closed.",
-                ));
+                lines.push(Line::from(format!("Current time {}", local_time(now))));
                 lines.push(Line::default());
-                let mut choices = Vec::new();
-                for (index, action) in app.resume_actions().iter().enumerate() {
-                    if index > 0 {
-                        choices.push(Span::raw("   "));
-                    }
-                    let label = match action {
-                        ResumeAction::Continue => "y Continue",
-                        ResumeAction::Save => "s Save checkpoint",
-                        ResumeAction::Discard => "n Discard",
-                    };
-                    let style = if index == app.resume_selection {
+
+                let selected = app.resume_actions()[app.resume_selection];
+                let current_duration = format_duration(timer.elapsed_seconds(now) * 1000);
+                let (save_label, save_detail) = match checkpoint {
+                    Some(last_seen) => (
+                        format!(
+                            "[s] Save and stop · {}",
+                            format_duration(timer.elapsed_ms(last_seen))
+                        ),
+                        " · ends at the last checkpoint",
+                    ),
+                    None => ("[s] Save and stop".into(), " · no checkpoint available"),
+                };
+                for (action, label, detail) in [
+                    (
+                        ResumeAction::Continue,
+                        format!("[y] Continue timer · {current_duration}"),
+                        " · includes time away",
+                    ),
+                    (ResumeAction::Save, save_label, save_detail),
+                    (
+                        ResumeAction::Discard,
+                        "[n] Discard session".into(),
+                        " · deletes the session",
+                    ),
+                ] {
+                    let style = if action == selected {
                         Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    } else if action == ResumeAction::Save && checkpoint.is_none() {
+                        Style::default().add_modifier(Modifier::DIM)
                     } else {
                         Style::default()
                     };
-                    choices.push(Span::styled(label, style));
-                }
-                lines.push(Line::from(choices));
-                if !app.message.is_empty() {
-                    lines.push(Line::from(app.message.as_str()));
+                    let marker = if action == selected { "> " } else { "  " };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{marker}{label}"), style),
+                        Span::raw(detail),
+                    ]));
                 }
                 let prompt = Paragraph::new(lines)
                     .wrap(Wrap { trim: true })
@@ -163,7 +172,7 @@ pub(crate) fn format_duration(duration_ms: u64) -> String {
 
 fn help_text(screen: Screen) -> &'static str {
     match screen {
-        Screen::ResumeTimer => "←→ Select · Enter Confirm · Esc Quit",
+        Screen::ResumeTimer => "↑↓ Select · Enter Confirm · Esc Quit",
         Screen::Dashboard => "↑↓ Select · Enter Open · PgUp/PgDn Scroll study time",
         Screen::TimerTopicSelect => "Type to search · ↑↓ Select · Enter Start or create · Esc Back",
         Screen::TopicSelect => "Type to search · ↑↓ Select · Enter Open · Esc Back",

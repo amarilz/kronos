@@ -784,7 +784,7 @@ mod tests {
             timer.last_seen(),
             DateTime::from_timestamp_millis(checkpoint.timestamp_millis())
         );
-        press(&mut app, KeyCode::Right)?;
+        press(&mut app, KeyCode::Down)?;
         press(&mut app, KeyCode::Enter)?;
         assert!(app.screen == Screen::Dashboard);
         assert!(app.active_timer.is_none());
@@ -834,7 +834,18 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(prompt.contains("Last checkpoint at"));
-        assert!(prompt.contains("y Continue   s Save checkpoint   n Discard"));
+        let choice_rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .filter(|row| ["[y]", "[s]", "[n]"].iter().any(|key| row.contains(key)))
+            .count();
+        assert_eq!(choice_rows, 3);
+        assert!(prompt.contains("> [y] Continue timer"));
+        assert!(prompt.contains("[s] Save and stop"));
+        assert!(prompt.contains("[n] Discard session"));
         assert!(prompt.contains("Esc Quit"));
 
         press(&mut app, KeyCode::Enter)?;
