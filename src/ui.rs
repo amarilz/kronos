@@ -4,8 +4,8 @@ mod history;
 pub(crate) mod setup;
 pub(crate) mod study_entry;
 
-use crate::{App, Screen};
-use chrono::Utc;
+use crate::{App, ResumeAction, Screen};
+use chrono::{DateTime, Local, Utc};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
@@ -19,7 +19,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         && let Some(timer) = &app.active_timer
     {
         let seconds = timer.elapsed_seconds(Utc::now());
-        let clock = format_duration(seconds as u64 * 1000);
+        let clock = format_duration(seconds * 1000);
         let mut lines = vec![
             Line::from(format!("Timer running · {}", timer.topic)),
             Line::from(clock),
@@ -55,17 +55,67 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         Screen::Dashboard => dashboard::draw(frame, app, content),
         Screen::ResumeTimer => {
             if let Some(timer) = &app.active_timer {
-                let prompt = Paragraph::new(vec![
-                    Line::from(format!(
-                        "Continue the running timer for \"{}\"?",
-                        timer.topic
-                    )),
-                    Line::from("Discarding deletes the session without adding study time."),
-                    Line::default(),
-                    choice_line("y Continue", "n Discard", app.resume_discard),
-                ])
-                .wrap(Wrap { trim: true })
-                .block(Block::bordered().title("Resume study timer"));
+                let now = Utc::now();
+                let local_time = |time: DateTime<Utc>| {
+                    time.with_timezone(&Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                };
+                let mut lines = vec![Line::from(format!("Study timer for \"{}\"", timer.topic))];
+                if let Some(start) = DateTime::from_timestamp_millis(timer.started_at) {
+                    lines.push(Line::from(format!("Started at {}", local_time(start))));
+                }
+                let checkpoint = timer.last_seen();
+                if let Some(last_seen) = checkpoint {
+                    lines.push(Line::from(format!(
+                        "Last checkpoint at {}",
+                        local_time(last_seen)
+                    )));
+                }
+                lines.push(Line::from(format!("Current time {}", local_time(now))));
+                lines.push(Line::default());
+
+                let selected = app.resume_actions()[app.resume_selection];
+                let current_duration = format_duration(timer.elapsed_seconds(now) * 1000);
+                let (save_label, save_detail) = match checkpoint {
+                    Some(last_seen) => (
+                        format!(
+                            "[s] Save and stop · {}",
+                            format_duration(timer.elapsed_ms(last_seen))
+                        ),
+                        " · ends at the last checkpoint",
+                    ),
+                    None => ("[s] Save and stop".into(), " · no checkpoint available"),
+                };
+                for (action, label, detail) in [
+                    (
+                        ResumeAction::Continue,
+                        format!("[y] Continue timer · {current_duration}"),
+                        " · includes time away",
+                    ),
+                    (ResumeAction::Save, save_label, save_detail),
+                    (
+                        ResumeAction::Discard,
+                        "[n] Discard session".into(),
+                        " · deletes the session",
+                    ),
+                ] {
+                    let style = if action == selected {
+                        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    } else if action == ResumeAction::Save && checkpoint.is_none() {
+                        Style::default().add_modifier(Modifier::DIM)
+                    } else {
+                        Style::default()
+                    };
+                    let marker = if action == selected { "> " } else { "  " };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{marker}{label}"), style),
+                        Span::raw(detail),
+                    ]));
+                }
+                let prompt = Paragraph::new(lines)
+                    .wrap(Wrap { trim: true })
+                    .block(Block::bordered().title("Resume study timer"));
                 frame.render_widget(prompt, content);
             }
         }
@@ -122,7 +172,7 @@ pub(crate) fn format_duration(duration_ms: u64) -> String {
 
 fn help_text(screen: Screen) -> &'static str {
     match screen {
-        Screen::ResumeTimer => "←→ Select · Enter Confirm · Esc Quit",
+        Screen::ResumeTimer => "↑↓ Select · Enter Confirm · Esc Quit",
         Screen::Dashboard => "↑↓ Select · Enter Open · PgUp/PgDn Scroll study time",
         Screen::TimerTopicSelect => "Type to search · ↑↓ Select · Enter Start or create · Esc Back",
         Screen::TopicSelect => "Type to search · ↑↓ Select · Enter Open · Esc Back",

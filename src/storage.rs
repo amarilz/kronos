@@ -25,14 +25,22 @@ pub struct ActiveTimer {
     pub id: i64,
     pub topic: String,
     pub started_at: i64,
+    pub last_seen_at: Option<i64>,
 }
 
 impl ActiveTimer {
-    pub fn elapsed_seconds(&self, now: DateTime<Utc>) -> i64 {
+    pub fn last_seen(&self) -> Option<DateTime<Utc>> {
+        self.last_seen_at.and_then(DateTime::from_timestamp_millis)
+    }
+
+    pub fn elapsed_ms(&self, now: DateTime<Utc>) -> u64 {
         now.timestamp_millis()
             .saturating_sub(self.started_at)
-            .max(0)
-            / 1000
+            .max(0) as u64
+    }
+
+    pub fn elapsed_seconds(&self, now: DateTime<Utc>) -> u64 {
+        self.elapsed_ms(now) / 1000
     }
 }
 
@@ -262,7 +270,7 @@ impl Store {
         Ok(self
             .connection
             .query_row(
-                "SELECT daily_entries.id, topics.name, started_at
+                "SELECT daily_entries.id, topics.name, started_at, last_seen_at
              FROM daily_entries JOIN topics ON topics.id = daily_entries.topic_id
              WHERE minutes IS NULL AND ended_at IS NULL",
                 [],
@@ -271,6 +279,7 @@ impl Store {
                         id: row.get(0)?,
                         topic: row.get(1)?,
                         started_at: row.get(2)?,
+                        last_seen_at: row.get(3)?,
                     })
                 },
             )
@@ -279,8 +288,8 @@ impl Store {
 
     pub fn start_timer(&self, topic: &str, now: DateTime<Utc>) -> Result<()> {
         let inserted = self.connection.execute(
-            "INSERT INTO daily_entries(date, topic_id, started_at)
-             SELECT ?3, id, ?2 FROM topics WHERE name = ?1
+            "INSERT INTO daily_entries(date, topic_id, started_at, last_seen_at)
+             SELECT ?3, id, ?2, ?2 FROM topics WHERE name = ?1
              ON CONFLICT DO NOTHING",
             params![
                 topic,
@@ -294,6 +303,16 @@ impl Store {
             }
             bail!("Could not start a timer for \"{topic}\"");
         }
+        Ok(())
+    }
+
+    pub fn checkpoint_timer(&self, id: i64, now: DateTime<Utc>) -> Result<()> {
+        self.connection.execute(
+            "UPDATE daily_entries SET last_seen_at = ?2
+             WHERE id = ?1 AND minutes IS NULL AND ended_at IS NULL
+               AND ?2 >= COALESCE(last_seen_at, started_at)",
+            params![id, now.timestamp_millis()],
+        )?;
         Ok(())
     }
 
@@ -346,7 +365,7 @@ impl Store {
             };
             if date == start_date {
                 transaction.execute(
-                    "UPDATE daily_entries SET ended_at = ?1 WHERE id = ?2",
+                    "UPDATE daily_entries SET ended_at = ?1, last_seen_at = NULL WHERE id = ?2",
                     params![portion_end, id],
                 )?;
             } else {
