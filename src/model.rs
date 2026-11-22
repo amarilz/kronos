@@ -1,5 +1,8 @@
 use chrono::{Datelike, Duration, NaiveDate};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CurrentEntry {
@@ -124,6 +127,35 @@ pub fn iso_week_key(date: NaiveDate) -> (i32, u32) {
 
 pub fn current_week(today: NaiveDate) -> NaiveDate {
     week_start(today)
+}
+
+pub fn rank_study_time<'a>(
+    today: NaiveDate,
+    weeks: Option<i64>,
+    archived: &[HistoryEntry],
+    daily: impl IntoIterator<Item = &'a CurrentEntry>,
+) -> Vec<(String, u64)> {
+    let end = iso_week_key(today);
+    let start = weeks.map(|count| iso_week_key(week_start(today) - Duration::weeks(count - 1)));
+    let includes = |week| start.is_none_or(|start| (start..=end).contains(&week));
+    let mut totals = BTreeMap::<&str, u64>::new();
+    for entry in archived {
+        if includes((entry.iso_year, entry.iso_week)) {
+            *totals.entry(&entry.topic).or_default() += u64::from(entry.minutes) * 60_000;
+        }
+    }
+    for entry in daily {
+        if includes(iso_week_key(entry.date)) {
+            *totals.entry(&entry.topic).or_default() += entry.duration_ms;
+        }
+    }
+    let mut ranking: Vec<_> = totals
+        .into_iter()
+        .filter(|(_, duration)| *duration > 0)
+        .map(|(topic, duration)| (topic.to_owned(), duration))
+        .collect();
+    ranking.sort_by_key(|(_, duration)| Reverse(*duration));
+    ranking
 }
 
 pub fn aggregate_current(entries: &[CurrentEntry]) -> BTreeMap<String, u64> {
