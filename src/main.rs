@@ -1,4 +1,6 @@
 mod config;
+#[cfg(target_os = "macos")]
+mod menu_bar;
 mod model;
 mod storage;
 mod ui;
@@ -145,10 +147,14 @@ impl App {
         }
     }
 
+    fn running_timer(&self) -> Option<&ActiveTimer> {
+        self.active_timer
+            .as_ref()
+            .filter(|_| self.screen != Screen::ResumeTimer)
+    }
+
     fn checkpoint_timer(&self, now: DateTime<Utc>) -> Result<()> {
-        if self.screen != Screen::ResumeTimer
-            && let Some(timer) = &self.active_timer
-        {
+        if let Some(timer) = self.running_timer() {
             self.store.checkpoint_timer(timer.id, now)?;
         }
         Ok(())
@@ -215,9 +221,7 @@ impl App {
         {
             key.code = KeyCode::Char(HOME_ACTIONS[self.home_selection].1);
         }
-        if self.screen != Screen::ResumeTimer
-            && let Some(timer) = &self.active_timer
-        {
+        if let Some(timer) = self.running_timer() {
             match key.code {
                 KeyCode::Left | KeyCode::Up => self.timer_quit = false,
                 KeyCode::Right | KeyCode::Down => self.timer_quit = true,
@@ -584,6 +588,8 @@ fn run(mut app: App) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let result = event_loop(&mut terminal, &mut app);
+    #[cfg(target_os = "macos")]
+    menu_bar::update(None);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -605,6 +611,12 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         {
             app.reload()?;
         }
+        #[cfg(target_os = "macos")]
+        menu_bar::update(
+            app.running_timer()
+                .map(|timer| timer.elapsed_seconds(Utc::now())),
+        );
+
         terminal.draw(|frame| ui::draw(frame, app))?;
         if event::poll(StdDuration::from_millis(200))?
             && let Event::Key(key) = event::read()?
