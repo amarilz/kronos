@@ -124,6 +124,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         Screen::Duration => study_entry::draw_duration(frame, app, content),
         Screen::AddTopic => study_entry::draw_add_topic(frame, app, content),
         Screen::History => history::draw(frame, app, content),
+        Screen::Ranking => history::draw_ranking(frame, app, content),
         Screen::GoalProgress => goals::draw_progress(frame, &app.goal_progress, content),
         Screen::EditGoal => goals::draw_editor(frame, &app.goal_input, content),
     }
@@ -177,7 +178,8 @@ fn help_text(screen: Screen) -> &'static str {
         Screen::DateSelect => "←→ Day, month, year · ↑↓ Adjust · Enter Apply · Esc Cancel",
         Screen::AddTopic => "Enter Confirm · Esc Back",
         Screen::Duration => "Tab Change field · Enter Confirm · Esc Back",
-        Screen::History => "← Older week · → Newer week · Esc Back",
+        Screen::History => "Tab Ranking · ← Older week · → Newer week · Esc Back",
+        Screen::Ranking => "Tab Weekly · ←→ Period · ↑↓ Scroll · Esc Back",
         Screen::GoalProgress => "Enter Set weekly goal · Esc Back",
         Screen::EditGoal => "Enter Save · Esc Back",
     }

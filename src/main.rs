@@ -36,6 +36,7 @@ enum Screen {
     Duration,
     AddTopic,
     History,
+    Ranking,
     GoalProgress,
     EditGoal,
 }
@@ -46,6 +47,12 @@ const HOME_ACTIONS: [(&str, char); 5] = [
     ("History", 'h'),
     ("Goals", 'g'),
     ("Quit", 'q'),
+];
+
+const RANKING_PERIODS: [(&str, Option<i64>); 3] = [
+    ("All time", None),
+    ("Last 4 weeks", Some(4)),
+    ("Last 12 weeks", Some(12)),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -81,6 +88,9 @@ struct App {
     topic_filter: String,
     history_weeks: Vec<(i32, u32)>,
     history_index: usize,
+    ranking_period: usize,
+    ranking_scroll: usize,
+    ranking: Vec<(String, u64)>,
     goal_progress: GoalProgress,
     snapshot_date: NaiveDate,
     goal_input: String,
@@ -117,6 +127,9 @@ impl App {
             topic_filter: String::new(),
             history_weeks: Vec::new(),
             history_index: 0,
+            ranking_period: 0,
+            ranking_scroll: 0,
+            ranking: Vec::new(),
             goal_progress: GoalProgress::NoGoal,
             snapshot_date: today,
             goal_input: String::new(),
@@ -204,6 +217,9 @@ impl App {
         self.history_index = self
             .history_index
             .min(self.history_weeks.len().saturating_sub(1));
+        if self.screen == Screen::Ranking {
+            self.refresh_ranking();
+        }
         Ok(())
     }
 
@@ -308,6 +324,7 @@ impl App {
                 KeyCode::Char('h') => {
                     self.reload()?;
                     self.history_index = 0;
+                    self.ranking_period = 0;
                     self.screen = Screen::History;
                 }
                 KeyCode::PageUp => self.dashboard_scroll = self.dashboard_scroll.saturating_sub(1),
@@ -435,8 +452,33 @@ impl App {
             },
             Screen::History => match key.code {
                 KeyCode::Esc | KeyCode::Char('h') => self.screen = Screen::Dashboard,
+                KeyCode::Tab | KeyCode::BackTab => {
+                    self.screen = Screen::Ranking;
+                    self.refresh_ranking();
+                }
                 KeyCode::Left => self.move_history(1),
                 KeyCode::Right => self.move_history(-1),
+                _ => {}
+            },
+            Screen::Ranking => match key.code {
+                KeyCode::Esc | KeyCode::Char('h') => self.screen = Screen::Dashboard,
+                KeyCode::Tab | KeyCode::BackTab => self.screen = Screen::History,
+                KeyCode::Left | KeyCode::Right => {
+                    let step = if key.code == KeyCode::Left { -1 } else { 1 };
+                    let period = self
+                        .ranking_period
+                        .saturating_add_signed(step)
+                        .min(RANKING_PERIODS.len() - 1);
+                    if period != self.ranking_period {
+                        self.ranking_period = period;
+                        self.refresh_ranking();
+                    }
+                }
+                KeyCode::Up => self.ranking_scroll = self.ranking_scroll.saturating_sub(1),
+                KeyCode::Down => {
+                    self.ranking_scroll =
+                        (self.ranking_scroll + 1).min(self.ranking.len().saturating_sub(1));
+                }
                 _ => {}
             },
         }
@@ -517,6 +559,16 @@ impl App {
         if let Some(adjusted) = adjusted.filter(|date| *date <= Local::now().date_naive()) {
             self.date_draft = adjusted;
         }
+    }
+
+    fn refresh_ranking(&mut self) {
+        self.ranking = model::rank_study_time(
+            self.snapshot_date,
+            RANKING_PERIODS[self.ranking_period].1,
+            &self.history,
+            self.current.iter().chain(&self.pending_history),
+        );
+        self.ranking_scroll = 0;
     }
 
     fn move_history(&mut self, direction: isize) {
@@ -606,8 +658,10 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
                 app.message = format!("Could not save timer checkpoint · {error}");
             }
         }
-        if matches!(app.screen, Screen::Dashboard | Screen::GoalProgress)
-            && app.snapshot_date != Local::now().date_naive()
+        if matches!(
+            app.screen,
+            Screen::Dashboard | Screen::GoalProgress | Screen::History | Screen::Ranking
+        ) && app.snapshot_date != Local::now().date_naive()
         {
             app.reload()?;
         }
@@ -634,6 +688,62 @@ mod tests {
     use chrono::Duration;
     use crossterm::event::KeyModifiers;
     use ratatui::{backend::TestBackend, style::Color};
+
+    #[test]
+    fn history_ranking_combines_current_and_archived_time_for_each_period() -> Result<()> {
+        let directory = storage::tests::temporary_directory();
+        let mut store = Store::create_new(&directory.join("kronos.sqlite3"))?;
+        let monday = week_start(Local::now().date_naive());
+        store.add_topic("rust")?;
+        store.add_topic("systems")?;
+        for (weeks_ago, topic, minutes) in [
+            (0, "rust", 20),
+            (3, "rust", 25),
+            (4, "systems", 60),
+            (11, "rust", 10),
+            (12, "rust", 10),
+        ] {
+            store.add_study(monday - Duration::weeks(weeks_ago), topic, minutes)?;
+        }
+        let mut app = App::new(store)?;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.handle_key(key(KeyCode::Char('h')))?;
+        assert!(app.screen == Screen::History);
+        app.handle_key(key(KeyCode::Tab))?;
+        assert!(app.screen == Screen::Ranking);
+        let totals = |app: &App| {
+            app.ranking
+                .iter()
+                .map(|(topic, ms)| (topic.clone(), ms / 60_000))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(totals(&app), [("rust".into(), 65), ("systems".into(), 60)]);
+        app.handle_key(key(KeyCode::Right))?;
+        assert_eq!(totals(&app), [("rust".into(), 45)]);
+        app.handle_key(key(KeyCode::Right))?;
+        assert_eq!(totals(&app), [("systems".into(), 60), ("rust".into(), 55)]);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 16))?;
+        terminal.draw(|frame| ui::draw(frame, &app))?;
+        let output: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(output.contains("All time  Last 4 weeks  Last 12 weeks"));
+        assert!(output.contains("Total 1h 55m"));
+        assert!(output.find("systems").unwrap() < output.find("rust").unwrap());
+        app.handle_key(key(KeyCode::Tab))?;
+        assert!(app.screen == Screen::History);
+        app.handle_key(key(KeyCode::Left))?;
+        assert_eq!(app.history_index, 1);
+
+        drop(app);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
 
     #[test]
     fn history_shows_each_weeks_goal_and_colors_its_balance() -> Result<()> {
