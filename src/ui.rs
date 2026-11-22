@@ -15,9 +15,7 @@ use ratatui::{
 };
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
-    if app.screen != Screen::ResumeTimer
-        && let Some(timer) = &app.active_timer
-    {
+    if let Some(timer) = app.running_timer() {
         let seconds = timer.elapsed_seconds(Utc::now());
         let clock = format_duration(seconds * 1000);
         let mut lines = vec![

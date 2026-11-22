@@ -484,9 +484,10 @@ dependencies = [
 
 [[package]]
 name = "kronos"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
+ "cc",
  "chrono",
  "clap",
  "crossterm",
